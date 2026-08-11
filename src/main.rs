@@ -584,10 +584,11 @@ impl MinlabelApp {
 
         ui.horizontal(|ui| {
             ui.label("Progress:");
+            let checked = self.labels.iter().filter(|l| l.is_check).count();
             let progress = if self.files.is_empty() {
                 0.0
             } else {
-                (self.current_index + 1) as f32 / self.files.len() as f32
+                checked as f32 / self.files.len() as f32
             };
             let bar = egui::ProgressBar::new(progress).show_percentage();
             ui.add_sized([ui.available_width() - 50.0, 18.0], bar);
