@@ -244,9 +244,8 @@ impl eframe::App for MinlabelApp {
             egui::Sense::drag(),
         );
         if sep_response.dragged() {
-            if let Some(delta) = sep_response.drag_delta() {
-                self.left_width = (self.left_width + delta.x).clamp(120.0, 500.0);
-            }
+            let delta = sep_response.drag_delta();
+            self.left_width = (self.left_width + delta.x).clamp(120.0, 500.0);
         }
         if sep_response.hovered() || sep_response.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
