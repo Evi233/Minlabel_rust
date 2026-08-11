@@ -30,6 +30,7 @@ struct MinlabelApp {
     status: String,
     player: Player,
     left_width: f32,
+    size_col_width: f32,
 }
 
 impl MinlabelApp {
@@ -44,6 +45,7 @@ impl MinlabelApp {
             status: String::new(),
             player: Player::new(),
             left_width: 220.0,
+            size_col_width: 80.0,
         }
     }
 
@@ -206,30 +208,61 @@ impl eframe::App for MinlabelApp {
                 if self.files.is_empty() {
                     ui.label("No folder opened.");
                 } else {
+                    let row_height = ui.text_style_height(&egui::TextStyle::Body);
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        egui::Grid::new("file_grid")
-                            .striped(true)
-                            .min_col_width(60.0)
-                            .show(ui, |ui| {
-                                ui.strong("Name");
-                                ui.strong("Size");
-                                ui.end_row();
-                                for (i, file) in self.files.iter().enumerate() {
-                                    let selected = i == self.current_index;
-                                    let name = file
-                                        .file_name()
-                                        .map(|n| n.to_string_lossy().to_string())
-                                        .unwrap_or_else(|| file.display().to_string());
-                                    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
-                                    if ui.selectable_label(selected, name).clicked() {
-                                        self.current_index = i;
-                                        self.playing = false;
-                                        self.player.stop();
-                                    }
-                                    ui.label(format_size(size));
-                                    ui.end_row();
+                        let name_col = (self.left_width - self.size_col_width - 8.0).max(40.0);
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                [name_col, row_height],
+                                egui::Label::new(egui::RichText::new("Name").strong()).truncate(),
+                            );
+                            let (sep_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(8.0, row_height),
+                                egui::Sense::hover(),
+                            );
+                            let sep_response = ui.interact(
+                                sep_rect,
+                                egui::Id::new("col_separator"),
+                                egui::Sense::drag(),
+                            );
+                            if sep_response.dragged() {
+                                self.size_col_width = (self.size_col_width
+                                    + sep_response.drag_delta().x)
+                                    .clamp(40.0, 200.0);
+                            }
+                            if sep_response.hovered() || sep_response.dragged() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                            }
+                            ui.add_sized(
+                                [self.size_col_width, row_height],
+                                egui::Label::new(egui::RichText::new("Size").strong()).truncate(),
+                            );
+                        });
+                        for (i, file) in self.files.iter().enumerate() {
+                            let selected = i == self.current_index;
+                            let name = file
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| file.display().to_string());
+                            let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+                            let name_col =
+                                (self.left_width - self.size_col_width - 8.0).max(40.0);
+                            ui.horizontal(|ui| {
+                                let resp = ui.add_sized(
+                                    [name_col, row_height],
+                                    egui::Button::selectable(selected, name).truncate(),
+                                );
+                                if resp.clicked() {
+                                    self.current_index = i;
+                                    self.playing = false;
+                                    self.player.stop();
                                 }
+                                ui.add_sized(
+                                    [self.size_col_width, row_height],
+                                    egui::Label::new(format_size(size)).truncate(),
+                                );
                             });
+                        }
                     });
                 }
             });
@@ -296,6 +329,11 @@ impl MinlabelApp {
 
         let duration = self.player.duration_secs();
         let mut pos = self.player.position_secs();
+        if self.playing && !self.player.is_playing() {
+            self.playing = false;
+            self.player.seek(0.0);
+            pos = 0.0;
+        }
         let slider = egui::Slider::new(&mut pos, 0.0..=duration.max(0.001))
             .show_value(false)
             .trailing_fill(true);
@@ -393,6 +431,10 @@ impl Player {
 
     fn pause(&mut self) {
         self.playing.store(false, Ordering::SeqCst);
+    }
+
+    fn is_playing(&self) -> bool {
+        self.playing.load(Ordering::SeqCst)
     }
 
     fn play(&mut self, path: &PathBuf) -> Result<(), String> {
