@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
@@ -25,6 +27,7 @@ struct MinlabelApp {
     playing: bool,
     show_about: bool,
     status: String,
+    player: Player,
 }
 
 impl MinlabelApp {
@@ -36,6 +39,7 @@ impl MinlabelApp {
             playing: false,
             show_about: false,
             status: String::new(),
+            player: Player::new(),
         }
     }
 
@@ -45,6 +49,7 @@ impl MinlabelApp {
             self.files = Self::collect_files(&path);
             self.current_index = 0;
             self.playing = false;
+            self.player.stop();
             self.status = format!("Opened folder: {}", path.display());
         }
     }
@@ -69,6 +74,7 @@ impl MinlabelApp {
         }
         self.current_index = (self.current_index + 1) % self.files.len();
         self.playing = false;
+        self.player.stop();
     }
 
     fn previous_file(&mut self) {
@@ -77,6 +83,7 @@ impl MinlabelApp {
         }
         self.current_index = (self.current_index + self.files.len() - 1) % self.files.len();
         self.playing = false;
+        self.player.stop();
     }
 
     fn toggle_play(&mut self) {
@@ -84,7 +91,22 @@ impl MinlabelApp {
             self.status = "No files loaded. Open a folder first.".to_string();
             return;
         }
-        self.playing = !self.playing;
+        if self.playing {
+            self.player.pause();
+            self.playing = false;
+        } else {
+            let file = self.files[self.current_index].clone();
+            match self.player.play(&file) {
+                Ok(()) => {
+                    self.playing = true;
+                    self.status = format!("Playing: {}", file.display());
+                }
+                Err(e) => {
+                    self.playing = false;
+                    self.status = format!("Failed to play: {e}");
+                }
+            }
+        }
     }
 
     fn export(&mut self) {
@@ -189,6 +211,7 @@ impl eframe::App for MinlabelApp {
                             if ui.selectable_label(selected, name).clicked() {
                                 self.current_index = i;
                                 self.playing = false;
+                                self.player.stop();
                             }
                         }
                     });
@@ -196,37 +219,7 @@ impl eframe::App for MinlabelApp {
             });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("Minlabel");
-            ui.separator();
-            match &self.folder {
-                Some(folder) => {
-                    ui.label(format!("Folder: {}", folder.display()));
-                }
-                None => {
-                    ui.label("No folder opened. Use File > Open Folder.");
-                }
-            }
-            ui.label(format!(
-                "Files: {}  |  Current: {} / {}",
-                self.files.len(),
-                if self.files.is_empty() {
-                    0
-                } else {
-                    self.current_index + 1
-                },
-                self.files.len()
-            ));
-            if let Some(file) = self.current_file() {
-                ui.label(format!("Current file: {}", file.display()));
-            }
-            ui.label(format!(
-                "Playback: {}",
-                if self.playing { "Playing" } else { "Stopped" }
-            ));
-            if !self.status.is_empty() {
-                ui.separator();
-                ui.label(&self.status);
-            }
+            self.player_ui(ui);
         });
 
         if self.show_about {
@@ -243,4 +236,236 @@ impl eframe::App for MinlabelApp {
                 });
         }
     }
+}
+
+impl MinlabelApp {
+    fn player_ui(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        match self.current_file() {
+            Some(file) => {
+                ui.label(
+                    egui::RichText::new(file.display().to_string())
+                        .strong()
+                        .size(16.0),
+                );
+            }
+            None => {
+                ui.label("No file selected. Open a folder first.");
+                return;
+            }
+        }
+        ui.add_space(8.0);
+
+        let duration = self.player.duration_secs();
+        let mut pos = self.player.position_secs();
+        let slider = egui::Slider::new(&mut pos, 0.0..=duration.max(0.001))
+            .show_value(false)
+            .trailing_fill(true);
+        if ui.add(slider).changed() {
+            self.player.seek(pos);
+        }
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            let play_btn = egui::Button::new(egui::RichText::new("\u{25B6}").size(18.0))
+                .min_size(egui::vec2(36.0, 30.0));
+            if ui.add(play_btn).clicked() {
+                self.toggle_play();
+            }
+
+            let pause_btn = egui::Button::new(egui::RichText::new("\u{23F8}").size(18.0))
+                .min_size(egui::vec2(36.0, 30.0));
+            if ui.add(pause_btn).clicked() {
+                self.player.pause();
+                self.playing = false;
+            }
+
+            ui.menu_button("\u{1F3A7}", |ui| {
+                let devices = self.player.devices();
+                if devices.is_empty() {
+                    ui.label("No audio devices found.");
+                } else {
+                    for name in devices {
+                        let selected = self.player.device.as_deref() == Some(name.as_str());
+                        if ui.selectable_label(selected, name).clicked() {
+                            self.player.set_device(&name);
+                            if self.playing {
+                                if let Some(file) = self.current_file() {
+                                    let _ = self.player.play(file);
+                                }
+                            }
+                            ui.close();
+                        }
+                    }
+                }
+            });
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} / {}",
+                        format_time(pos),
+                        format_time(duration)
+                    ))
+                    .monospace(),
+                );
+            });
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Audio player
+
+struct Player {
+    stream: Option<cpal::Stream>,
+    samples: Arc<Mutex<Vec<f32>>>,
+    sample_rate: u32,
+    channels: u16,
+    position: Arc<AtomicU64>,
+    playing: Arc<AtomicBool>,
+    device: Option<String>,
+}
+
+impl Player {
+    fn new() -> Self {
+        Self {
+            stream: None,
+            samples: Arc::new(Mutex::new(Vec::new())),
+            sample_rate: 44100,
+            channels: 1,
+            position: Arc::new(AtomicU64::new(0)),
+            playing: Arc::new(AtomicBool::new(false)),
+            device: None,
+        }
+    }
+
+    fn stop(&mut self) {
+        self.playing.store(false, Ordering::SeqCst);
+        if let Some(stream) = self.stream.take() {
+            drop(stream);
+        }
+        self.position.store(0, Ordering::SeqCst);
+        self.samples.lock().unwrap().clear();
+    }
+
+    fn pause(&mut self) {
+        self.playing.store(false, Ordering::SeqCst);
+    }
+
+    fn play(&mut self, path: &PathBuf) -> Result<(), String> {
+        self.stop();
+        let mut reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;
+        let spec = reader.spec();
+        let sample_rate = spec.sample_rate;
+        let channels = spec.channels;
+        let samples: Vec<f32> = match spec.sample_format {
+            hound::SampleFormat::Float => reader
+                .samples::<f32>()
+                .map(|s| s.unwrap_or(0.0))
+                .collect(),
+            hound::SampleFormat::Int => {
+                let bits = spec.bits_per_sample;
+                let max = (1i64 << (bits - 1)) as f32;
+                reader
+                    .samples::<i32>()
+                    .map(|s| s.unwrap_or(0) as f32 / max)
+                    .collect()
+            }
+        };
+        if samples.is_empty() {
+            return Err("No audio samples".to_string());
+        }
+        *self.samples.lock().unwrap() = samples;
+        self.sample_rate = sample_rate;
+        self.channels = channels;
+        self.position.store(0, Ordering::SeqCst);
+        self.playing.store(true, Ordering::SeqCst);
+
+        let samples = Arc::clone(&self.samples);
+        let position = Arc::clone(&self.position);
+        let playing = Arc::clone(&self.playing);
+        let channels = channels as usize;
+
+        let host = cpal::default_host();
+        let device = host
+            .default_output_device()
+            .ok_or_else(|| "No output device".to_string())?;
+        self.device = device.name().ok();
+        let config = device
+            .default_output_config()
+            .map_err(|e| e.to_string())?;
+        let stream = device
+            .build_output_stream(
+                &config.into(),
+                move |data: &mut [f32], _| {
+                    let mut samples = samples.lock().unwrap();
+                    let pos = position.load(Ordering::SeqCst) as usize;
+                    if !playing.load(Ordering::SeqCst) {
+                        for s in data.iter_mut() {
+                            *s = 0.0;
+                        }
+                        return;
+                    }
+                    for (i, s) in data.iter_mut().enumerate() {
+                        let idx = pos + i;
+                        if idx < samples.len() {
+                            *s = samples[idx];
+                        } else {
+                            *s = 0.0;
+                        }
+                    }
+                    let new_pos = pos + data.len();
+                    if new_pos >= samples.len() {
+                        playing.store(false, Ordering::SeqCst);
+                    }
+                    position.store(new_pos as u64, Ordering::SeqCst);
+                },
+                |err| eprintln!("Audio stream error: {err}"),
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+        stream.play().map_err(|e| e.to_string())?;
+        self.stream = Some(stream);
+        Ok(())
+    }
+
+    fn duration_secs(&self) -> f64 {
+        let n = self.samples.lock().unwrap().len();
+        if n == 0 || self.sample_rate == 0 {
+            0.0
+        } else {
+            n as f64 / self.sample_rate as f64 / self.channels as f64
+        }
+    }
+
+    fn position_secs(&self) -> f64 {
+        let pos = self.position.load(Ordering::SeqCst) as f64;
+        if self.sample_rate == 0 {
+            0.0
+        } else {
+            pos / self.sample_rate as f64 / self.channels as f64
+        }
+    }
+
+    fn seek(&mut self, secs: f64) {
+        let idx = (secs * self.sample_rate as f64 * self.channels as f64) as u64;
+        self.position.store(idx, Ordering::SeqCst);
+    }
+
+    fn devices(&self) -> Vec<String> {
+        let host = cpal::default_host();
+        host.output_devices()
+            .map(|devs| devs.filter_map(|d| d.name().ok()).collect::<Vec<_>>())
+            .unwrap_or_default()
+    }
+
+    fn set_device(&mut self, name: &str) {
+        self.device = Some(name.to_string());
+    }
+}
+
+fn format_time(secs: f64) -> String {
+    let secs = secs.max(0.0) as u64;
+    format!("{:02}:{:02}", secs / 60, secs % 60)
 }
