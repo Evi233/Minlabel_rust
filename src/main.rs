@@ -29,6 +29,7 @@ struct MinlabelApp {
     show_about: bool,
     status: String,
     player: Player,
+    left_width: f32,
 }
 
 impl MinlabelApp {
@@ -42,6 +43,7 @@ impl MinlabelApp {
             show_about: false,
             status: String::new(),
             player: Player::new(),
+            left_width: 220.0,
         }
     }
 
@@ -198,9 +200,8 @@ impl eframe::App for MinlabelApp {
         });
 
         egui::Panel::left("file_list")
-            .resizable(true)
-            .default_size(220.0)
-            .min_size(120.0)
+            .resizable(false)
+            .exact_size(self.left_width)
             .show(ui, |ui| {
                 if self.files.is_empty() {
                     ui.label("No folder opened.");
@@ -219,10 +220,7 @@ impl eframe::App for MinlabelApp {
                                         .file_name()
                                         .map(|n| n.to_string_lossy().to_string())
                                         .unwrap_or_else(|| file.display().to_string());
-                                    let size = file
-                                        .metadata()
-                                        .map(|m| m.len())
-                                        .unwrap_or(0);
+                                    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
                                     if ui.selectable_label(selected, name).clicked() {
                                         self.current_index = i;
                                         self.playing = false;
@@ -235,6 +233,29 @@ impl eframe::App for MinlabelApp {
                     });
                 }
             });
+
+        let separator_rect = egui::Rect::from_min_max(
+            egui::pos2(self.left_width, 0.0),
+            egui::pos2(self.left_width + 4.0, ui.available_height()),
+        );
+        let sep_response = ui.interact(
+            separator_rect,
+            egui::Id::new("left_separator"),
+            egui::Sense::drag(),
+        );
+        if sep_response.dragged() {
+            if let Some(delta) = sep_response.drag_delta() {
+                self.left_width = (self.left_width + delta.x).clamp(120.0, 500.0);
+            }
+        }
+        if sep_response.hovered() || sep_response.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        ui.painter().vline(
+            self.left_width + 2.0,
+            ui.available_rect_before_wrap().y_range(),
+            egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        );
 
         egui::CentralPanel::default().show(ui, |ui| {
             self.player_ui(ui);
@@ -344,6 +365,7 @@ struct Player {
     position: Arc<AtomicU64>,
     playing: Arc<AtomicBool>,
     device: Option<String>,
+    loaded_path: Option<PathBuf>,
 }
 
 impl Player {
@@ -356,6 +378,7 @@ impl Player {
             position: Arc::new(AtomicU64::new(0)),
             playing: Arc::new(AtomicBool::new(false)),
             device: None,
+            loaded_path: None,
         }
     }
 
@@ -366,6 +389,7 @@ impl Player {
         }
         self.position.store(0, Ordering::SeqCst);
         self.samples.lock().unwrap().clear();
+        self.loaded_path = None;
     }
 
     fn pause(&mut self) {
@@ -373,28 +397,66 @@ impl Player {
     }
 
     fn play(&mut self, path: &PathBuf) -> Result<(), String> {
-        self.stop();
-        let mut reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;
-        let spec = reader.spec();
-        let file_sample_rate = spec.sample_rate;
-        let channels = spec.channels;
-        let samples: Vec<f32> = match spec.sample_format {
-            hound::SampleFormat::Float => reader
-                .samples::<f32>()
-                .map(|s| s.unwrap_or(0.0))
-                .collect(),
-            hound::SampleFormat::Int => {
-                let bits = spec.bits_per_sample;
-                let max = (1i64 << (bits - 1)) as f32;
-                reader
-                    .samples::<i32>()
-                    .map(|s| s.unwrap_or(0) as f32 / max)
-                    .collect()
-            }
-        };
-        if samples.is_empty() {
-            return Err("No audio samples".to_string());
+        self.playing.store(false, Ordering::SeqCst);
+        if let Some(stream) = self.stream.take() {
+            drop(stream);
         }
+
+        let same_file = self.loaded_path.as_deref() == Some(path.as_path());
+        if !same_file {
+            let mut reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;
+            let spec = reader.spec();
+            let file_sample_rate = spec.sample_rate;
+            let channels = spec.channels;
+            let samples: Vec<f32> = match spec.sample_format {
+                hound::SampleFormat::Float => reader
+                    .samples::<f32>()
+                    .map(|s| s.unwrap_or(0.0))
+                    .collect(),
+                hound::SampleFormat::Int => {
+                    let bits = spec.bits_per_sample;
+                    let max = (1i64 << (bits - 1)) as f32;
+                    reader
+                        .samples::<i32>()
+                        .map(|s| s.unwrap_or(0) as f32 / max)
+                        .collect()
+                }
+            };
+            if samples.is_empty() {
+                return Err("No audio samples".to_string());
+            }
+
+            let host = cpal::default_host();
+            let device = host
+                .default_output_device()
+                .ok_or_else(|| "No output device".to_string())?;
+            self.device = Some(device.to_string());
+            let config = device
+                .default_output_config()
+                .map_err(|e| e.to_string())?;
+            let device_sample_rate = config.sample_rate();
+            let device_channels = config.channels() as usize;
+
+            let samples = resample_frames(
+                &samples,
+                channels as usize,
+                file_sample_rate,
+                device_sample_rate,
+            );
+            let samples = convert_channels(&samples, channels as usize, device_channels);
+
+            *self.samples.lock().unwrap() = samples;
+            self.sample_rate = device_sample_rate;
+            self.channels = device_channels as u16;
+            self.position.store(0, Ordering::SeqCst);
+            self.loaded_path = Some(path.clone());
+        }
+
+        self.playing.store(true, Ordering::SeqCst);
+
+        let samples = Arc::clone(&self.samples);
+        let position = Arc::clone(&self.position);
+        let playing = Arc::clone(&self.playing);
 
         let host = cpal::default_host();
         let device = host
@@ -404,22 +466,6 @@ impl Player {
         let config = device
             .default_output_config()
             .map_err(|e| e.to_string())?;
-        let device_sample_rate = config.sample_rate();
-        let device_channels = config.channels() as usize;
-
-        let samples = resample_frames(&samples, channels as usize, file_sample_rate, device_sample_rate);
-        let samples = convert_channels(&samples, channels as usize, device_channels);
-
-        *self.samples.lock().unwrap() = samples;
-        self.sample_rate = device_sample_rate;
-        self.channels = device_channels as u16;
-        self.position.store(0, Ordering::SeqCst);
-        self.playing.store(true, Ordering::SeqCst);
-
-        let samples = Arc::clone(&self.samples);
-        let position = Arc::clone(&self.position);
-        let playing = Arc::clone(&self.playing);
-
         let stream = device
             .build_output_stream(
                 config.into(),
