@@ -135,7 +135,7 @@ impl MinlabelApp {
             self.status = format!("Failed to write json: {e}");
             return;
         }
-        if let Err(e) = std::fs::write(&lab_path, data.lab) {
+        if let Err(e) = std::fs::write(&lab_path, &data.lab) {
             self.status = format!("Failed to write lab: {e}");
             return;
         }
@@ -325,9 +325,11 @@ impl eframe::App for MinlabelApp {
                                 egui::Label::new(egui::RichText::new("Size").strong()).truncate(),
                             );
                         });
-                        for (i, file) in self.files.iter().enumerate() {
+                        let files = self.files.clone();
+                        let labels = self.labels.clone();
+                        for (i, file) in files.iter().enumerate() {
                             let selected = i == self.current_index;
-                            let checked = self.labels.get(i).map(|l| l.is_check).unwrap_or(false);
+                            let checked = labels.get(i).map(|l| l.is_check).unwrap_or(false);
                             let name = file
                                 .file_name()
                                 .map(|n| n.to_string_lossy().to_string())

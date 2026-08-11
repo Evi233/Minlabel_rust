@@ -56,7 +56,7 @@ impl Transcriber {
         }
     }
 
-    fn transcribe_cn(&self, text: &str, cantonese: bool) -> String {
+    fn transcribe_cn(&self, text: &str, _cantonese: bool) -> String {
         let simplified = self.to_simplified(text);
         let mut result = Vec::new();
         let chars: Vec<char> = simplified.chars().collect();
