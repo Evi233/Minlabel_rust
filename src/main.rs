@@ -155,10 +155,7 @@ impl eframe::App for MinlabelApp {
                     }
                 });
                 ui.menu_button("Playback", |ui| {
-                    if ui
-                        .button(if self.playing { "Stop" } else { "Play" })
-                        .clicked()
-                    {
+                    if ui.button("play/stop").clicked() {
                         self.toggle_play();
                         ui.close();
                     }
@@ -171,6 +168,32 @@ impl eframe::App for MinlabelApp {
                 });
             });
         });
+
+        egui::Panel::left("file_list")
+            .resizable(true)
+            .default_size(220.0)
+            .min_size(120.0)
+            .show(ui, |ui| {
+                ui.heading("Files");
+                ui.separator();
+                if self.files.is_empty() {
+                    ui.label("No folder opened.");
+                } else {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for (i, file) in self.files.iter().enumerate() {
+                            let selected = i == self.current_index;
+                            let name = file
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| file.display().to_string());
+                            if ui.selectable_label(selected, name).clicked() {
+                                self.current_index = i;
+                                self.playing = false;
+                            }
+                        }
+                    });
+                }
+            });
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("Minlabel");
