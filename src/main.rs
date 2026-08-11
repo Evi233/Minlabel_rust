@@ -50,8 +50,10 @@ struct MinlabelApp {
     show_connect: bool,
     connect_info: ConnectInfo,
     net: Option<NetClient>,
-    locks: std::collections::HashMap<String, String>,
-    remote_files: Vec<String>,
+    locks: std::collections::HashMap<u32, String>,
+    remote_files: Vec<net::FileInfo>,
+    file_ids: std::collections::HashMap<String, u32>,
+    remote_progress: Option<(u32, u32)>,
 }
 
 impl MinlabelApp {
@@ -77,6 +79,8 @@ impl MinlabelApp {
             net: None,
             locks: std::collections::HashMap::new(),
             remote_files: Vec::new(),
+            file_ids: std::collections::HashMap::new(),
+            remote_progress: None,
         }
     }
 
@@ -215,13 +219,27 @@ impl MinlabelApp {
     }
 
     fn do_connect(&mut self) {
-        match NetClient::connect(&self.connect_info) {
+        let info = self.connect_info.clone();
+        match NetClient::connect(&info) {
             Ok(client) => {
                 self.net = Some(client);
                 self.status = format!(
                     "Connecting to {}:{} as {}...",
-                    self.connect_info.server, self.connect_info.port, self.connect_info.username
+                    info.server, info.port, info.username
                 );
+                match net::fetch_file_list(&info.server, info.http_port) {
+                    Ok(files) => {
+                        self.remote_files = files.clone();
+                        self.file_ids.clear();
+                        for f in &files {
+                            self.file_ids.insert(f.name.clone(), f.id);
+                        }
+                        self.status = format!("Connected, {} files", files.len());
+                    }
+                    Err(e) => {
+                        self.status = format!("Connected but file list failed: {e}");
+                    }
+                }
             }
             Err(e) => {
                 self.status = format!("Connect failed: {e}");
@@ -240,34 +258,44 @@ impl MinlabelApp {
                 NetEvent::Disconnected(reason) => {
                     self.status = format!("Disconnected: {reason}");
                     self.net = None;
+                    self.locks.clear();
                 }
-                NetEvent::FileList(files) => {
-                    self.remote_files = files;
-                    self.status = format!("Received {} files", self.remote_files.len());
-                }
-                NetEvent::Locked { file, username } => {
-                    self.locks.insert(file.clone(), username.clone());
-                    if self.current_file().map(|f| f.file_name().map(|n| n.to_string_lossy().to_string()) == Some(file.clone())).unwrap_or(false) {
-                        self.status = format!("{username} is annotating this file");
+                NetEvent::Presence { user, file_id } => {
+                    self.locks.insert(file_id, user.clone());
+                    if self.current_file_id() == Some(file_id) {
+                        self.status = format!("{user} is annotating this file");
                     }
                 }
-                NetEvent::Unlocked { file } => {
-                    self.locks.remove(&file);
+                NetEvent::Released { user: _, file_id } => {
+                    self.locks.remove(&file_id);
                 }
-                NetEvent::LabelUpdated { file, label } => {
+                NetEvent::Annotated { user: _, file_id, data } => {
                     if let Some(i) = self.files.iter().position(|f| {
-                        f.file_name().map(|n| n.to_string_lossy().to_string()) == Some(file.clone())
+                        self.file_ids
+                            .get(&f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default())
+                            == Some(&file_id)
                     }) {
                         if i < self.labels.len() {
-                            self.labels[i] = label;
+                            self.labels[i] = data;
                         }
                     }
+                }
+                NetEvent::Progress { done, total } => {
+                    self.remote_progress = Some((done, total));
                 }
                 NetEvent::Error(msg) => {
                     self.status = format!("Net error: {msg}");
                 }
             }
         }
+    }
+
+    fn current_file_id(&self) -> Option<u32> {
+        let name = self
+            .current_file()?
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())?;
+        self.file_ids.get(&name).copied()
     }
 
     fn current_file(&self) -> Option<&PathBuf> {
@@ -383,6 +411,7 @@ impl eframe::App for MinlabelApp {
                         let files = self.files.clone();
                         let labels = self.labels.clone();
                         let locks = self.locks.clone();
+                        let file_ids = self.file_ids.clone();
                         for (i, file) in files.iter().enumerate() {
                             let selected = i == self.current_index;
                             let checked = labels.get(i).map(|l| l.is_check).unwrap_or(false);
@@ -393,7 +422,8 @@ impl eframe::App for MinlabelApp {
                             let size = file.metadata().map(|m| m.len()).unwrap_or(0);
                             let name_col =
                                 (self.left_width - self.size_col_width - 8.0).max(40.0);
-                            let locked_by = locks.get(&name).cloned();
+                            let fid = file_ids.get(&name).copied();
+                            let locked_by = fid.and_then(|id| locks.get(&id).cloned());
                             ui.horizontal(|ui| {
                                 if let Some(user) = &locked_by {
                                     ui.colored_label(egui::Color32::YELLOW, "\u{25CF}");
@@ -534,11 +564,11 @@ impl MinlabelApp {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
-                if let Some(user) = self.locks.get(&name) {
-                    ui.colored_label(
-                        egui::Color32::RED,
-                        format!("{user} 正在标注"),
-                    );
+                if let Some(user) = self
+                    .current_file_id()
+                    .and_then(|id| self.locks.get(&id).cloned())
+                {
+                    ui.colored_label(egui::Color32::RED, format!("{user} 正在标注"));
                 }
                 ui.label(
                     egui::RichText::new(file.display().to_string())
@@ -688,11 +718,16 @@ impl MinlabelApp {
 
         ui.horizontal(|ui| {
             ui.label("Progress:");
-            let checked = self.labels.iter().filter(|l| l.is_check).count();
-            let progress = if self.files.is_empty() {
+            let (done, total) = if let Some((d, t)) = self.remote_progress {
+                (d, t)
+            } else {
+                let checked = self.labels.iter().filter(|l| l.is_check).count();
+                (checked as u32, self.files.len() as u32)
+            };
+            let progress = if total == 0 {
                 0.0
             } else {
-                checked as f32 / self.files.len() as f32
+                done as f32 / total as f32
             };
             let bar = egui::ProgressBar::new(progress).show_percentage();
             ui.add_sized([ui.available_width() - 50.0, 18.0], bar);

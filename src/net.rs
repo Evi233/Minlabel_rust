@@ -25,23 +25,11 @@ impl Default for ConnectInfo {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ServerMsg {
-    Hello { username: String },
-    FileList { files: Vec<String> },
-    Lock { file: String, username: String },
-    Unlock { file: String },
-    Label { file: String, label: LabelData },
-    Error { message: String },
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ClientMsg {
-    Hello { username: String },
-    RequestLock { file: String },
-    ReleaseLock { file: String },
-    SubmitLabel { file: String, label: LabelData },
+pub struct FileInfo {
+    pub id: u32,
+    pub name: String,
+    pub status: String,
+    pub annotated_by: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -56,14 +44,42 @@ pub struct LabelData {
     pub raw_text: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientMsg {
+    Claim { file_id: u32 },
+    Release { file_id: u32 },
+    Annotate {
+        file_id: u32,
+        data: LabelData,
+    },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerMsg {
+    Presence { user: String, file_id: u32 },
+    Release { user: String, file_id: u32 },
+    Annotated {
+        user: String,
+        file_id: u32,
+        data: LabelData,
+    },
+    Progress { done: u32, total: u32 },
+}
+
 #[derive(Clone, Debug)]
 pub enum NetEvent {
     Connected,
     Disconnected(String),
-    FileList(Vec<String>),
-    Locked { file: String, username: String },
-    Unlocked { file: String },
-    LabelUpdated { file: String, label: LabelData },
+    Presence { user: String, file_id: u32 },
+    Released { user: String, file_id: u32 },
+    Annotated {
+        user: String,
+        file_id: u32,
+        data: LabelData,
+    },
+    Progress { done: u32, total: u32 },
     Error(String),
 }
 
@@ -81,11 +97,13 @@ impl NetClient {
         let connected = Arc::new(Mutex::new(false));
         let connected_clone = Arc::clone(&connected);
 
-        let url = format!("ws://{}:{}/ws", info.server, info.port);
+        let url = format!(
+            "ws://{}:{}/ws?user={}",
+            info.server,
+            info.port,
+            urlencode(&info.username)
+        );
         let username = info.username.clone();
-        let hello = ClientMsg::Hello {
-            username: username.clone(),
-        };
 
         thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -109,10 +127,6 @@ impl NetClient {
                 *connected_clone.lock().unwrap() = true;
                 let _ = evt_tx.send(NetEvent::Connected);
 
-                let _ = ws.send(tokio_tungstenite::tungstenite::Message::Text(
-                    serde_json::to_string(&hello).unwrap_or_default(),
-                ));
-
                 loop {
                     tokio::select! {
                         msg = msg_rx.recv() => {
@@ -127,12 +141,10 @@ impl NetClient {
                                 Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
                                     if let Ok(msg) = serde_json::from_str::<ServerMsg>(&text) {
                                         let evt = match msg {
-                                            ServerMsg::Hello { username } => NetEvent::Locked { file: String::new(), username },
-                                            ServerMsg::FileList { files } => NetEvent::FileList(files),
-                                            ServerMsg::Lock { file, username } => NetEvent::Locked { file, username },
-                                            ServerMsg::Unlock { file } => NetEvent::Unlocked { file },
-                                            ServerMsg::Label { file, label } => NetEvent::LabelUpdated { file, label },
-                                            ServerMsg::Error { message } => NetEvent::Error(message),
+                                            ServerMsg::Presence { user, file_id } => NetEvent::Presence { user, file_id },
+                                            ServerMsg::Release { user, file_id } => NetEvent::Released { user, file_id },
+                                            ServerMsg::Annotated { user, file_id, data } => NetEvent::Annotated { user, file_id, data },
+                                            ServerMsg::Progress { done, total } => NetEvent::Progress { done, total },
                                         };
                                         let _ = evt_tx.send(evt);
                                     }
@@ -166,22 +178,18 @@ impl NetClient {
         let _ = self.tx.send(msg);
     }
 
-    pub fn request_lock(&self, file: &str) {
-        self.send(ClientMsg::RequestLock {
-            file: file.to_string(),
-        });
+    pub fn claim(&self, file_id: u32) {
+        self.send(ClientMsg::Claim { file_id });
     }
 
-    pub fn release_lock(&self, file: &str) {
-        self.send(ClientMsg::ReleaseLock {
-            file: file.to_string(),
-        });
+    pub fn release(&self, file_id: u32) {
+        self.send(ClientMsg::Release { file_id });
     }
 
-    pub fn submit_label(&self, file: &str, label: &LabelData) {
-        self.send(ClientMsg::SubmitLabel {
-            file: file.to_string(),
-            label: label.clone(),
+    pub fn annotate(&self, file_id: u32, data: &LabelData) {
+        self.send(ClientMsg::Annotate {
+            file_id,
+            data: data.clone(),
         });
     }
 
@@ -190,15 +198,19 @@ impl NetClient {
     }
 }
 
-pub fn fetch_file_list(http_port: u16) -> Result<Vec<String>, String> {
-    let url = format!("http://127.0.0.1:{http_port}/files");
+pub fn fetch_file_list(server: &str, http_port: u16) -> Result<Vec<FileInfo>, String> {
+    let url = format!("http://{server}:{http_port}/api/files");
     let resp = reqwest::blocking::get(&url).map_err(|e| e.to_string())?;
-    let list: Vec<String> = resp.json().map_err(|e| e.to_string())?;
+    let list: Vec<FileInfo> = resp.json().map_err(|e| e.to_string())?;
     Ok(list)
 }
 
-pub fn fetch_label(http_port: u16, file: &str) -> Result<Option<LabelData>, String> {
-    let url = format!("http://127.0.0.1:{http_port}/label/{}", urlencode(file));
+pub fn fetch_annotation(
+    server: &str,
+    http_port: u16,
+    file_id: u32,
+) -> Result<Option<LabelData>, String> {
+    let url = format!("http://{server}:{http_port}/api/annotations/{file_id}");
     let resp = reqwest::blocking::get(&url).map_err(|e| e.to_string())?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
@@ -207,8 +219,13 @@ pub fn fetch_label(http_port: u16, file: &str) -> Result<Option<LabelData>, Stri
     Ok(Some(label))
 }
 
-pub fn fetch_wav(http_port: u16, file: &str, dest: &std::path::Path) -> Result<(), String> {
-    let url = format!("http://127.0.0.1:{http_port}/wav/{}", urlencode(file));
+pub fn fetch_audio(
+    server: &str,
+    http_port: u16,
+    file_id: u32,
+    dest: &std::path::Path,
+) -> Result<(), String> {
+    let url = format!("http://{server}:{http_port}/api/files/{file_id}/audio");
     let resp = reqwest::blocking::get(&url).map_err(|e| e.to_string())?;
     let bytes = resp.bytes().map_err(|e| e.to_string())?;
     std::fs::write(dest, bytes).map_err(|e| e.to_string())
@@ -227,4 +244,4 @@ fn urlencode(s: &str) -> String {
     out
 }
 
-pub type LockMap = HashMap<String, String>;
+pub type LockMap = HashMap<u32, String>;
