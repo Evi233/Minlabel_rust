@@ -168,13 +168,13 @@ impl MinlabelApp {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::E)) {
             self.export();
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowRight)) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown)) {
             self.next_file();
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowLeft)) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp)) {
             self.previous_file();
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space)) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F5)) {
             self.toggle_play();
         }
     }
@@ -327,9 +327,16 @@ impl eframe::App for MinlabelApp {
                 .collapsible(false)
                 .resizable(false)
                 .show(ui.ctx(), |ui| {
-                    ui.label("Minlabel");
-                    ui.label("A minimal image labeling tool.");
+                    ui.heading("Minlabel");
+                    ui.label("A minimal audio labeling tool.");
                     ui.label("Version 0.1.0");
+                    ui.separator();
+                    ui.label("Shortcuts:");
+                    ui.label("  PageDown  - Next file");
+                    ui.label("  PageUp    - Previous file");
+                    ui.label("  F5        - Play / Stop");
+                    ui.label("  Ctrl+O    - Open folder");
+                    ui.label("  Ctrl+E    - Export");
                     ui.separator();
                     ui.hyperlink("https://github.com/Evi233/Minlabel_rust");
                 });
