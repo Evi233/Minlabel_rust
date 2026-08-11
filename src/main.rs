@@ -7,6 +7,28 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
+const ICON_PLAY: char = '\u{e037}';
+const ICON_PAUSE: char = '\u{e034}';
+const ICON_HEADPHONES: char = '\u{f01f}';
+const ICON_PASTE: char = '\u{e14f}';
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Pinyin,
+    Romaji,
+    Cantonese,
+}
+
+impl Mode {
+    fn to_string(&self) -> &'static str {
+        match self {
+            Mode::Pinyin => "pinyin",
+            Mode::Romaji => "romaji",
+            Mode::Cantonese => "cantonese",
+        }
+    }
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -31,6 +53,9 @@ struct MinlabelApp {
     player: Player,
     left_width: f32,
     size_col_width: f32,
+    paste_text: String,
+    annotation_text: String,
+    mode: Mode,
 }
 
 impl MinlabelApp {
@@ -46,6 +71,9 @@ impl MinlabelApp {
             player: Player::new(),
             left_width: 220.0,
             size_col_width: 80.0,
+            paste_text: String::new(),
+            annotation_text: String::new(),
+            mode: Mode::Pinyin,
         }
     }
 
@@ -344,20 +372,20 @@ impl MinlabelApp {
         ui.add_space(4.0);
 
         ui.horizontal(|ui| {
-            let play_btn = egui::Button::new(egui::RichText::new("\u{25B6}").size(18.0))
+            let play_btn = egui::Button::new(egui::RichText::new(ICON_PLAY).size(18.0))
                 .min_size(egui::vec2(36.0, 30.0));
             if ui.add(play_btn).clicked() {
                 self.toggle_play();
             }
 
-            let pause_btn = egui::Button::new(egui::RichText::new("\u{23F8}").size(18.0))
+            let pause_btn = egui::Button::new(egui::RichText::new(ICON_PAUSE).size(18.0))
                 .min_size(egui::vec2(36.0, 30.0));
             if ui.add(pause_btn).clicked() {
                 self.player.pause();
                 self.playing = false;
             }
 
-            ui.menu_button("\u{1F3A7}", |ui| {
+            ui.menu_button(egui::RichText::new(ICON_HEADPHONES).size(18.0), |ui| {
                 let devices = self.player.devices();
                 if devices.is_empty() {
                     ui.label("No audio devices found.");
@@ -387,6 +415,85 @@ impl MinlabelApp {
                     .monospace(),
                 );
             });
+        });
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            let paste_btn = egui::Button::new(egui::RichText::new(ICON_PASTE).size(18.0))
+                .min_size(egui::vec2(30.0, 24.0));
+            let resp = ui.add_sized(
+                [ui.available_width() - 34.0, 24.0],
+                egui::TextEdit::singleline(&mut self.paste_text).hint_text("Paste text here"),
+            );
+            if resp.changed() {
+                self.paste_text = self.paste_text.replace('\n', "");
+            }
+            if ui.add(paste_btn).clicked() {
+                if let Some(text) = ui.ctx().input(|i| i.events.clone()).iter().find_map(|e| {
+                    if let egui::Event::Paste(t) = e {
+                        Some(t.clone())
+                    } else {
+                        None
+                    }
+                }) {
+                    self.paste_text = text;
+                }
+            }
+        });
+
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            let btn_w = (ui.available_width() - 8.0) / 3.0;
+            if ui
+                .add_sized([btn_w, 26.0], egui::Button::new("Replace"))
+                .clicked()
+            {
+                self.status = "Replace clicked".to_string();
+            }
+            if ui
+                .add_sized([btn_w, 26.0], egui::Button::new("Append"))
+                .clicked()
+            {
+                self.status = "Append clicked".to_string();
+            }
+            egui::ComboBox::from_id_salt("mode_combo")
+                .selected_text(self.mode.to_string())
+                .width(btn_w)
+                .show_ui(ui, |ui| {
+                    for m in [Mode::Pinyin, Mode::Romaji, Mode::Cantonese] {
+                        ui.selectable_value(&mut self.mode, m, m.to_string());
+                    }
+                });
+        });
+
+        ui.add_space(4.0);
+
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                ui.add_sized(
+                    [ui.available_width(), ui.available_height()],
+                    egui::TextEdit::multiline(&mut self.annotation_text)
+                        .hint_text("Annotation text"),
+                );
+            });
+
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            ui.label("Progress:");
+            let progress = if self.files.is_empty() {
+                0.0
+            } else {
+                (self.current_index + 1) as f32 / self.files.len() as f32
+            };
+            let bar = egui::ProgressBar::new(progress).show_percentage();
+            ui.add_sized([ui.available_width() - 50.0, 18.0], bar);
+            ui.label(format!("{:.0}%", progress * 100.0));
         });
     }
 }
@@ -653,10 +760,17 @@ fn setup_fonts(ctx: &egui::Context) {
             "../assets/fonts/NotoEmoji-Regular.ttf"
         ))),
     );
+    fonts.font_data.insert(
+        "MaterialIcons".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/MaterialIcons-Regular.ttf"
+        ))),
+    );
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         let list = fonts.families.entry(family).or_default();
         list.insert(0, "NotoSansSC".to_owned());
         list.push("NotoEmoji".to_owned());
+        list.push("MaterialIcons".to_owned());
     }
     ctx.set_fonts(fonts);
 }
