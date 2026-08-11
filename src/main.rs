@@ -108,10 +108,10 @@ impl MinlabelApp {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::E)) {
             self.export();
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Right)) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowRight)) {
             self.next_file();
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Left)) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowLeft)) {
             self.previous_file();
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space)) {
@@ -121,37 +121,37 @@ impl MinlabelApp {
 }
 
 impl eframe::App for MinlabelApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.handle_shortcuts(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.handle_shortcuts(ui.ctx());
 
-        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
+        egui::Panel::top("menu_bar").show(ui, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Open Folder").clicked() {
                         self.open_folder();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Export").clicked() {
                         self.export();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Connect").clicked() {
                         self.connect();
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.separator();
                     if ui.button("Quit").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
                 ui.menu_button("Edit", |ui| {
                     if ui.button("Next File").clicked() {
                         self.next_file();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Previous File").clicked() {
                         self.previous_file();
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
                 ui.menu_button("Playback", |ui| {
@@ -160,19 +160,19 @@ impl eframe::App for MinlabelApp {
                         .clicked()
                     {
                         self.toggle_play();
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
                 ui.menu_button("Help", |ui| {
                     if ui.button("About").clicked() {
                         self.show_about = true;
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("Minlabel");
             ui.separator();
             match &self.folder {
@@ -211,7 +211,7 @@ impl eframe::App for MinlabelApp {
                 .open(&mut self.show_about)
                 .collapsible(false)
                 .resizable(false)
-                .show(ctx, |ui| {
+                .show(ui.ctx(), |ui| {
                     ui.label("Minlabel");
                     ui.label("A minimal image labeling tool.");
                     ui.label("Version 0.1.0");
