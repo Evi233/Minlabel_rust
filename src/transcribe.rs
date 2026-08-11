@@ -19,44 +19,57 @@ impl Mode {
 }
 
 pub struct Transcriber {
-    phrases: HashMap<String, Vec<String>>,
-    words: HashMap<String, Vec<String>>,
+    pinyin_phrases: HashMap<String, Vec<String>>,
+    pinyin_words: HashMap<String, Vec<String>>,
+    cantonese_phrases: HashMap<String, Vec<String>>,
+    cantonese_words: HashMap<String, Vec<String>>,
     trans: HashMap<String, String>,
 }
 
 impl Transcriber {
     pub fn new(dict_dir: &Path) -> Self {
-        let mut phrases = HashMap::new();
-        let mut words = HashMap::new();
+        let mut pinyin_phrases = HashMap::new();
+        let mut pinyin_words = HashMap::new();
+        let mut cantonese_phrases = HashMap::new();
+        let mut cantonese_words = HashMap::new();
         let mut trans = HashMap::new();
 
         let mandarin = dict_dir.join("mandarin");
         let cantonese = dict_dir.join("cantonese");
 
-        load_phrases(&mandarin.join("phrases_dict.txt"), &mut phrases);
-        load_words(&mandarin.join("word.txt"), &mut words);
+        load_phrases(&mandarin.join("phrases_dict.txt"), &mut pinyin_phrases);
+        load_words(&mandarin.join("word.txt"), &mut pinyin_words);
         load_trans(&mandarin.join("trans_word.txt"), &mut trans);
 
-        load_phrases(&cantonese.join("phrases_dict.txt"), &mut phrases);
-        load_words(&cantonese.join("word.txt"), &mut words);
+        load_phrases(&cantonese.join("phrases_dict.txt"), &mut cantonese_phrases);
+        load_words(&cantonese.join("word.txt"), &mut cantonese_words);
         load_trans(&cantonese.join("trans_word.txt"), &mut trans);
 
         Self {
-            phrases,
-            words,
+            pinyin_phrases,
+            pinyin_words,
+            cantonese_phrases,
+            cantonese_words,
             trans,
         }
     }
 
     pub fn transcribe(&self, text: &str, mode: &Mode) -> String {
         match mode {
-            Mode::Pinyin => self.transcribe_cn(text, false),
-            Mode::Cantonese => self.transcribe_cn(text, true),
+            Mode::Pinyin => self.transcribe_cn(text, &self.pinyin_phrases, &self.pinyin_words),
+            Mode::Cantonese => {
+                self.transcribe_cn(text, &self.cantonese_phrases, &self.cantonese_words)
+            }
             Mode::Romaji => kana_to_romaji(text),
         }
     }
 
-    fn transcribe_cn(&self, text: &str, _cantonese: bool) -> String {
+    fn transcribe_cn(
+        &self,
+        text: &str,
+        phrases: &HashMap<String, Vec<String>>,
+        words: &HashMap<String, Vec<String>>,
+    ) -> String {
         let simplified = self.to_simplified(text);
         let mut result = Vec::new();
         let chars: Vec<char> = simplified.chars().collect();
@@ -67,7 +80,7 @@ impl Transcriber {
                 let max_len = (chars.len() - i).min(8);
                 for len in (1..=max_len).rev() {
                     let phrase: String = chars[i..i + len].iter().collect();
-                    if let Some(syllables) = self.phrases.get(&phrase) {
+                    if let Some(syllables) = phrases.get(&phrase) {
                         result.extend(syllables.iter().cloned());
                         i += len;
                         matched = true;
@@ -78,7 +91,7 @@ impl Transcriber {
                     continue;
                 }
                 let ch = chars[i].to_string();
-                if let Some(syllables) = self.words.get(&ch) {
+                if let Some(syllables) = words.get(&ch) {
                     if let Some(first) = syllables.first() {
                         result.push(first.clone());
                     }
@@ -153,6 +166,9 @@ fn load_trans(path: &Path, map: &mut HashMap<String, String>) {
 fn strip_tone(s: &str) -> String {
     let mut out = String::new();
     for c in s.chars() {
+        if c.is_ascii_digit() {
+            continue;
+        }
         let base = match c {
             'ā' | 'á' | 'ǎ' | 'à' => 'a',
             'ē' | 'é' | 'ě' | 'è' => 'e',

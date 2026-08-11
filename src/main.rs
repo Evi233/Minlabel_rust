@@ -430,7 +430,6 @@ impl MinlabelApp {
             self.annotation_text.push('\n');
         }
         self.annotation_text = transcribed;
-        self.paste_text.clear();
         self.status = format!("Transcribed ({})", self.mode.to_string());
         self.save_current_label();
     }
