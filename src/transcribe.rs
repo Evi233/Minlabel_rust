@@ -313,6 +313,7 @@ fn kana_to_romaji(text: &str) -> String {
             },
         };
         out.push_str(romaji);
+        out.push(' ');
     }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    out.trim_end().to_string()
 }
