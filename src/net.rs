@@ -5,6 +5,7 @@ use std::thread;
 
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ConnectInfo {
@@ -85,7 +86,7 @@ pub enum NetEvent {
 }
 
 pub struct NetClient {
-    tx: Sender<ClientMsg>,
+    tx: mpsc::Sender<ClientMsg>,
     pub events: Arc<Mutex<Receiver<NetEvent>>>,
     pub connected: Arc<Mutex<bool>>,
     pub username: String,
@@ -93,7 +94,7 @@ pub struct NetClient {
 
 impl NetClient {
     pub fn connect(info: &ConnectInfo) -> Result<Self, String> {
-        let (msg_tx, msg_rx) = channel::<ClientMsg>();
+        let (msg_tx, mut msg_rx) = mpsc::channel::<ClientMsg>(64);
         let (evt_tx, evt_rx) = channel::<NetEvent>();
         let connected = Arc::new(Mutex::new(false));
         let connected_clone = Arc::clone(&connected);
@@ -176,7 +177,7 @@ impl NetClient {
     }
 
     pub fn send(&self, msg: ClientMsg) {
-        let _ = self.tx.send(msg);
+        let _ = self.tx.blocking_send(msg);
     }
 
     pub fn claim(&self, file_id: u32) {
