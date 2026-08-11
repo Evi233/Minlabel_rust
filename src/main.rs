@@ -392,13 +392,13 @@ impl Player {
         let device = host
             .default_output_device()
             .ok_or_else(|| "No output device".to_string())?;
-        self.device = device.name().ok();
+        self.device = Some(device.to_string());
         let config = device
             .default_output_config()
             .map_err(|e| e.to_string())?;
         let stream = device
             .build_output_stream(
-                &config.into(),
+                config.into(),
                 move |data: &mut [f32], _| {
                     let mut samples = samples.lock().unwrap();
                     let pos = position.load(Ordering::SeqCst) as usize;
@@ -457,7 +457,7 @@ impl Player {
     fn devices(&self) -> Vec<String> {
         let host = cpal::default_host();
         host.output_devices()
-            .map(|devs| devs.filter_map(|d| d.name().ok()).collect::<Vec<_>>())
+            .map(|devs| devs.map(|d| d.to_string()).collect::<Vec<_>>())
             .unwrap_or_default()
     }
 
