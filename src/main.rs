@@ -61,7 +61,11 @@ impl MinlabelApp {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_file() {
+                if path.is_file()
+                    && path
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
+                {
                     files.push(path);
                 }
             }
@@ -262,11 +266,9 @@ impl MinlabelApp {
         let mut pos = self.player.position_secs();
         let slider = egui::Slider::new(&mut pos, 0.0..=duration.max(0.001))
             .show_value(false)
-            .trailing_fill(true);
-        if ui
-            .add_sized([ui.available_width(), 20.0], slider)
-            .changed()
-        {
+            .trailing_fill(true)
+            .fill_width(true);
+        if ui.add(slider).changed() {
             self.player.seek(pos);
         }
         ui.add_space(4.0);
@@ -362,7 +364,7 @@ impl Player {
         self.stop();
         let mut reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;
         let spec = reader.spec();
-        let sample_rate = spec.sample_rate;
+        let file_sample_rate = spec.sample_rate;
         let channels = spec.channels;
         let samples: Vec<f32> = match spec.sample_format {
             hound::SampleFormat::Float => reader
@@ -381,15 +383,6 @@ impl Player {
         if samples.is_empty() {
             return Err("No audio samples".to_string());
         }
-        *self.samples.lock().unwrap() = samples;
-        self.sample_rate = sample_rate;
-        self.channels = channels;
-        self.position.store(0, Ordering::SeqCst);
-        self.playing.store(true, Ordering::SeqCst);
-
-        let samples = Arc::clone(&self.samples);
-        let position = Arc::clone(&self.position);
-        let playing = Arc::clone(&self.playing);
 
         let host = cpal::default_host();
         let device = host
@@ -399,6 +392,25 @@ impl Player {
         let config = device
             .default_output_config()
             .map_err(|e| e.to_string())?;
+        let device_sample_rate = config.sample_rate().0;
+        let device_channels = config.channels() as usize;
+
+        let samples = if file_sample_rate == device_sample_rate {
+            samples
+        } else {
+            resample(&samples, file_sample_rate, device_sample_rate)
+        };
+
+        *self.samples.lock().unwrap() = samples;
+        self.sample_rate = device_sample_rate;
+        self.channels = device_channels as u16;
+        self.position.store(0, Ordering::SeqCst);
+        self.playing.store(true, Ordering::SeqCst);
+
+        let samples = Arc::clone(&self.samples);
+        let position = Arc::clone(&self.position);
+        let playing = Arc::clone(&self.playing);
+
         let stream = device
             .build_output_stream(
                 config.into(),
@@ -472,6 +484,23 @@ impl Player {
 fn format_time(secs: f64) -> String {
     let secs = secs.max(0.0) as u64;
     format!("{:02}:{:02}", secs / 60, secs % 60)
+}
+
+fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    if from_rate == to_rate || samples.is_empty() {
+        return samples.to_vec();
+    }
+    let ratio = to_rate as f64 / from_rate as f64;
+    let out_len = (samples.len() as f64 * ratio).ceil() as usize;
+    let mut out = vec![0.0f32; out_len];
+    for (i, s) in out.iter_mut().enumerate() {
+        let src_pos = i as f64 / ratio;
+        let idx = src_pos.floor() as usize;
+        let frac = (src_pos - idx as f64) as f32;
+        let next = (idx + 1).min(samples.len() - 1);
+        *s = samples[idx] * (1.0 - frac) + samples[next] * frac;
+    }
+    out
 }
 
 fn setup_fonts(ctx: &egui::Context) {
