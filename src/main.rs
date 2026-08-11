@@ -8,20 +8,10 @@ use eframe::egui;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::{Deserialize, Serialize};
 
+mod net;
 mod transcribe;
+use net::{ConnectInfo, LabelData, NetClient, NetEvent};
 use transcribe::{Mode, Transcriber};
-
-#[derive(Serialize, Deserialize, Default, Clone)]
-struct LabelData {
-    #[serde(default)]
-    is_check: bool,
-    #[serde(default)]
-    lab: String,
-    #[serde(default)]
-    lab_without_tone: String,
-    #[serde(default)]
-    raw_text: String,
-}
 
 const ICON_PLAY: char = '\u{e037}';
 const ICON_PAUSE: char = '\u{e034}';
@@ -57,6 +47,11 @@ struct MinlabelApp {
     mode: Mode,
     transcriber: Transcriber,
     labels: Vec<LabelData>,
+    show_connect: bool,
+    connect_info: ConnectInfo,
+    net: Option<NetClient>,
+    locks: std::collections::HashMap<String, String>,
+    remote_files: Vec<String>,
 }
 
 impl MinlabelApp {
@@ -77,6 +72,11 @@ impl MinlabelApp {
             mode: Mode::Pinyin,
             transcriber: Transcriber::new(std::path::Path::new("assets/dict")),
             labels: Vec::new(),
+            show_connect: false,
+            connect_info: ConnectInfo::default(),
+            net: None,
+            locks: std::collections::HashMap::new(),
+            remote_files: Vec::new(),
         }
     }
 
@@ -211,7 +211,63 @@ impl MinlabelApp {
     }
 
     fn connect(&mut self) {
-        self.status = "Connect: not implemented yet".to_string();
+        self.show_connect = true;
+    }
+
+    fn do_connect(&mut self) {
+        match NetClient::connect(&self.connect_info) {
+            Ok(client) => {
+                self.net = Some(client);
+                self.status = format!(
+                    "Connecting to {}:{} as {}...",
+                    self.connect_info.server, self.connect_info.port, self.connect_info.username
+                );
+            }
+            Err(e) => {
+                self.status = format!("Connect failed: {e}");
+            }
+        }
+    }
+
+    fn poll_net(&mut self) {
+        let Some(net) = &self.net else { return };
+        let events = net.events.lock().unwrap();
+        while let Ok(evt) = events.try_recv() {
+            match evt {
+                NetEvent::Connected => {
+                    self.status = "Connected".to_string();
+                }
+                NetEvent::Disconnected(reason) => {
+                    self.status = format!("Disconnected: {reason}");
+                    self.net = None;
+                }
+                NetEvent::FileList(files) => {
+                    self.remote_files = files;
+                    self.status = format!("Received {} files", self.remote_files.len());
+                }
+                NetEvent::Locked { file, username } => {
+                    self.locks.insert(file.clone(), username.clone());
+                    if self.current_file().map(|f| f.file_name().map(|n| n.to_string_lossy().to_string()) == Some(file.clone())).unwrap_or(false) {
+                        self.status = format!("{username} is annotating this file");
+                    }
+                }
+                NetEvent::Unlocked { file } => {
+                    self.locks.remove(&file);
+                }
+                NetEvent::LabelUpdated { file, label } => {
+                    if let Some(i) = self.files.iter().position(|f| {
+                        f.file_name().map(|n| n.to_string_lossy().to_string()) == Some(file.clone())
+                    }) {
+                        if i < self.labels.len() {
+                            self.labels[i] = label;
+                        }
+                    }
+                }
+                NetEvent::Error(msg) => {
+                    self.status = format!("Net error: {msg}");
+                }
+            }
+        }
     }
 
     fn current_file(&self) -> Option<&PathBuf> {
@@ -239,6 +295,7 @@ impl MinlabelApp {
 
 impl eframe::App for MinlabelApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.poll_net();
         self.handle_shortcuts(ui.ctx());
 
         egui::Panel::top("menu_bar").show(ui, |ui| {
@@ -325,6 +382,7 @@ impl eframe::App for MinlabelApp {
                         });
                         let files = self.files.clone();
                         let labels = self.labels.clone();
+                        let locks = self.locks.clone();
                         for (i, file) in files.iter().enumerate() {
                             let selected = i == self.current_index;
                             let checked = labels.get(i).map(|l| l.is_check).unwrap_or(false);
@@ -335,14 +393,18 @@ impl eframe::App for MinlabelApp {
                             let size = file.metadata().map(|m| m.len()).unwrap_or(0);
                             let name_col =
                                 (self.left_width - self.size_col_width - 8.0).max(40.0);
+                            let locked_by = locks.get(&name).cloned();
                             ui.horizontal(|ui| {
+                                if let Some(user) = &locked_by {
+                                    ui.colored_label(egui::Color32::YELLOW, "\u{25CF}");
+                                }
                                 let text = if checked {
                                     egui::RichText::new(&name).weak()
                                 } else {
                                     egui::RichText::new(&name)
                                 };
                                 let resp = ui.add_sized(
-                                    [name_col, row_height],
+                                    [name_col - if locked_by.is_some() { 14.0 } else { 0.0 }, row_height],
                                     egui::Button::selectable(selected, text).truncate(),
                                 );
                                 if resp.clicked() {
@@ -413,6 +475,38 @@ impl eframe::App for MinlabelApp {
                     ui.hyperlink("https://github.com/Evi233/Minlabel_rust");
                 });
         }
+
+        if self.show_connect {
+            let mut open = true;
+            egui::Window::new("Connect")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label("Server address:");
+                    ui.text_edit_singleline(&mut self.connect_info.server);
+                    ui.label("Port (room):");
+                    ui.add(
+                        egui::DragValue::new(&mut self.connect_info.port)
+                            .range(1..=65535),
+                    );
+                    ui.label("HTTP port:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.connect_info.http_port)
+                            .range(1..=65535),
+                    );
+                    ui.label("Username:");
+                    ui.text_edit_singleline(&mut self.connect_info.username);
+                    ui.add_space(8.0);
+                    if ui.button("Connect").clicked() {
+                        self.do_connect();
+                        self.show_connect = false;
+                    }
+                });
+            if !open {
+                self.show_connect = false;
+            }
+        }
     }
 }
 
@@ -436,6 +530,16 @@ impl MinlabelApp {
         ui.add_space(4.0);
         match self.current_file() {
             Some(file) => {
+                let name = file
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if let Some(user) = self.locks.get(&name) {
+                    ui.colored_label(
+                        egui::Color32::RED,
+                        format!("{user} 正在标注"),
+                    );
+                }
                 ui.label(
                     egui::RichText::new(file.display().to_string())
                         .strong()
