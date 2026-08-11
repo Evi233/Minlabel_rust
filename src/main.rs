@@ -202,24 +202,36 @@ impl eframe::App for MinlabelApp {
             .default_size(220.0)
             .min_size(120.0)
             .show(ui, |ui| {
-                ui.heading("Files");
-                ui.separator();
                 if self.files.is_empty() {
                     ui.label("No folder opened.");
                 } else {
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        for (i, file) in self.files.iter().enumerate() {
-                            let selected = i == self.current_index;
-                            let name = file
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_else(|| file.display().to_string());
-                            if ui.selectable_label(selected, name).clicked() {
-                                self.current_index = i;
-                                self.playing = false;
-                                self.player.stop();
-                            }
-                        }
+                        egui::Grid::new("file_grid")
+                            .striped(true)
+                            .min_col_width(60.0)
+                            .show(ui, |ui| {
+                                ui.strong("Name");
+                                ui.strong("Size");
+                                ui.end_row();
+                                for (i, file) in self.files.iter().enumerate() {
+                                    let selected = i == self.current_index;
+                                    let name = file
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| file.display().to_string());
+                                    let size = file
+                                        .metadata()
+                                        .map(|m| m.len())
+                                        .unwrap_or(0);
+                                    if ui.selectable_label(selected, name).clicked() {
+                                        self.current_index = i;
+                                        self.playing = false;
+                                        self.player.stop();
+                                    }
+                                    ui.label(format_size(size));
+                                    ui.end_row();
+                                }
+                            });
                     });
                 }
             });
@@ -395,11 +407,8 @@ impl Player {
         let device_sample_rate = config.sample_rate();
         let device_channels = config.channels() as usize;
 
-        let samples = if file_sample_rate == device_sample_rate {
-            samples
-        } else {
-            resample(&samples, file_sample_rate, device_sample_rate)
-        };
+        let samples = resample_frames(&samples, channels as usize, file_sample_rate, device_sample_rate);
+        let samples = convert_channels(&samples, channels as usize, device_channels);
 
         *self.samples.lock().unwrap() = samples;
         self.sample_rate = device_sample_rate;
@@ -486,21 +495,61 @@ fn format_time(secs: f64) -> String {
     format!("{:02}:{:02}", secs / 60, secs % 60)
 }
 
-fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+fn resample_frames(samples: &[f32], channels: usize, from_rate: u32, to_rate: u32) -> Vec<f32> {
     if from_rate == to_rate || samples.is_empty() {
         return samples.to_vec();
     }
+    let frames = samples.len() / channels;
     let ratio = to_rate as f64 / from_rate as f64;
-    let out_len = (samples.len() as f64 * ratio).ceil() as usize;
-    let mut out = vec![0.0f32; out_len];
-    for (i, s) in out.iter_mut().enumerate() {
-        let src_pos = i as f64 / ratio;
+    let out_frames = (frames as f64 * ratio).ceil() as usize;
+    let mut out = vec![0.0f32; out_frames * channels];
+    for f in 0..out_frames {
+        let src_pos = f as f64 / ratio;
         let idx = src_pos.floor() as usize;
         let frac = (src_pos - idx as f64) as f32;
-        let next = (idx + 1).min(samples.len() - 1);
-        *s = samples[idx] * (1.0 - frac) + samples[next] * frac;
+        let next = (idx + 1).min(frames - 1);
+        for c in 0..channels {
+            let a = samples[idx * channels + c];
+            let b = samples[next * channels + c];
+            out[f * channels + c] = a * (1.0 - frac) + b * frac;
+        }
     }
     out
+}
+
+fn convert_channels(samples: &[f32], from: usize, to: usize) -> Vec<f32> {
+    if from == to || samples.is_empty() {
+        return samples.to_vec();
+    }
+    let frames = samples.len() / from;
+    let mut out = vec![0.0f32; frames * to];
+    for f in 0..frames {
+        for c in 0..to {
+            let src = if from == 1 {
+                samples[f]
+            } else {
+                samples[f * from + (c % from)]
+            };
+            out[f * to + c] = src;
+        }
+    }
+    out
+}
+
+fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.2} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn setup_fonts(ctx: &egui::Context) {
