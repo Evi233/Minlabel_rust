@@ -6,9 +6,22 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use serde::{Deserialize, Serialize};
 
 mod transcribe;
 use transcribe::{Mode, Transcriber};
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct LabelData {
+    #[serde(default)]
+    is_check: bool,
+    #[serde(default)]
+    lab: String,
+    #[serde(default)]
+    lab_without_tone: String,
+    #[serde(default)]
+    raw_text: String,
+}
 
 const ICON_PLAY: char = '\u{e037}';
 const ICON_PAUSE: char = '\u{e034}';
@@ -43,6 +56,7 @@ struct MinlabelApp {
     annotation_text: String,
     mode: Mode,
     transcriber: Transcriber,
+    labels: Vec<LabelData>,
 }
 
 impl MinlabelApp {
@@ -64,6 +78,7 @@ impl MinlabelApp {
             transcriber: Transcriber::new(std::path::Path::new(
                 "E:\\Evidencefiles\\dataset_tools\\dict",
             )),
+            labels: Vec::new(),
         }
     }
 
@@ -71,11 +86,61 @@ impl MinlabelApp {
         if let Some(path) = rfd::FileDialog::new().pick_folder() {
             self.folder = Some(path.clone());
             self.files = Self::collect_files(&path);
+            self.labels = vec![LabelData::default(); self.files.len()];
             self.current_index = 0;
             self.playing = false;
             self.player.stop();
+            self.load_current_label();
             self.status = format!("Opened folder: {}", path.display());
         }
+    }
+
+    fn load_current_label(&mut self) {
+        let Some(file) = self.current_file() else {
+            return;
+        };
+        let stem = file
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let json_path = file.with_file_name(format!("{stem}.json"));
+        if let Ok(content) = std::fs::read_to_string(&json_path) {
+            if let Ok(data) = serde_json::from_str::<LabelData>(&content) {
+                self.labels[self.current_index] = data;
+            }
+        }
+        self.paste_text = self.labels[self.current_index].raw_text.clone();
+        self.annotation_text = self.labels[self.current_index].lab.clone();
+    }
+
+    fn save_current_label(&mut self) {
+        let Some(file) = self.current_file() else {
+            return;
+        };
+        let stem = file
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let json_path = file.with_file_name(format!("{stem}.json"));
+        let lab_path = file.with_file_name(format!("{stem}.lab"));
+
+        let data = LabelData {
+            is_check: true,
+            lab: self.annotation_text.trim().to_string(),
+            lab_without_tone: self.annotation_text.trim().to_string(),
+            raw_text: self.paste_text.trim().to_string(),
+        };
+        let json = serde_json::to_string_pretty(&data).unwrap_or_default();
+        if let Err(e) = std::fs::write(&json_path, json) {
+            self.status = format!("Failed to write json: {e}");
+            return;
+        }
+        if let Err(e) = std::fs::write(&lab_path, data.lab) {
+            self.status = format!("Failed to write lab: {e}");
+            return;
+        }
+        self.labels[self.current_index] = data;
+        self.status = format!("Saved {} and {}", json_path.display(), lab_path.display());
     }
 
     fn collect_files(dir: &PathBuf) -> Vec<PathBuf> {
@@ -100,18 +165,22 @@ impl MinlabelApp {
         if self.files.is_empty() {
             return;
         }
+        self.save_current_label();
         self.current_index = (self.current_index + 1) % self.files.len();
         self.playing = false;
         self.player.stop();
+        self.load_current_label();
     }
 
     fn previous_file(&mut self) {
         if self.files.is_empty() {
             return;
         }
+        self.save_current_label();
         self.current_index = (self.current_index + self.files.len() - 1) % self.files.len();
         self.playing = false;
         self.player.stop();
+        self.load_current_label();
     }
 
     fn toggle_play(&mut self) {
@@ -258,6 +327,7 @@ impl eframe::App for MinlabelApp {
                         });
                         for (i, file) in self.files.iter().enumerate() {
                             let selected = i == self.current_index;
+                            let checked = self.labels.get(i).map(|l| l.is_check).unwrap_or(false);
                             let name = file
                                 .file_name()
                                 .map(|n| n.to_string_lossy().to_string())
@@ -266,18 +336,30 @@ impl eframe::App for MinlabelApp {
                             let name_col =
                                 (self.left_width - self.size_col_width - 8.0).max(40.0);
                             ui.horizontal(|ui| {
+                                let text = if checked {
+                                    egui::RichText::new(&name).weak()
+                                } else {
+                                    egui::RichText::new(&name)
+                                };
                                 let resp = ui.add_sized(
                                     [name_col, row_height],
-                                    egui::Button::selectable(selected, name).truncate(),
+                                    egui::Button::selectable(selected, text).truncate(),
                                 );
                                 if resp.clicked() {
+                                    self.save_current_label();
                                     self.current_index = i;
                                     self.playing = false;
                                     self.player.stop();
+                                    self.load_current_label();
                                 }
+                                let size_text = if checked {
+                                    egui::RichText::new(format_size(size)).weak()
+                                } else {
+                                    egui::RichText::new(format_size(size))
+                                };
                                 ui.add_sized(
                                     [self.size_col_width, row_height],
-                                    egui::Label::new(format_size(size)).truncate(),
+                                    egui::Label::new(size_text).truncate(),
                                 );
                             });
                         }
@@ -348,40 +430,7 @@ impl MinlabelApp {
         self.annotation_text = transcribed;
         self.paste_text.clear();
         self.status = format!("Transcribed ({})", self.mode.to_string());
-        self.save_outputs();
-    }
-
-    fn save_outputs(&mut self) {
-        let Some(file) = self.current_file() else {
-            self.status = "No file selected".to_string();
-            return;
-        };
-        let Some(folder) = &self.folder else {
-            return;
-        };
-        let stem = file
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let json_path = folder.join(format!("{stem}.json"));
-        let lab_path = folder.join(format!("{stem}.lab"));
-
-        let lab = self.annotation_text.trim();
-        let json = format!(
-            "{{\n    \"isCheck\": true,\n    \"lab\": \"{}\",\n    \"lab_without_tone\": \"{}\",\n    \"raw_text\": \"{}\"\n}}",
-            lab,
-            lab,
-            self.paste_text.trim()
-        );
-        if let Err(e) = std::fs::write(&json_path, json) {
-            self.status = format!("Failed to write json: {e}");
-            return;
-        }
-        if let Err(e) = std::fs::write(&lab_path, lab) {
-            self.status = format!("Failed to write lab: {e}");
-            return;
-        }
-        self.status = format!("Saved {} and {}", json_path.display(), lab_path.display());
+        self.save_current_label();
     }
 
     fn player_ui(&mut self, ui: &mut egui::Ui) {
