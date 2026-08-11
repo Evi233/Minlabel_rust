@@ -75,9 +75,7 @@ impl MinlabelApp {
             paste_text: String::new(),
             annotation_text: String::new(),
             mode: Mode::Pinyin,
-            transcriber: Transcriber::new(std::path::Path::new(
-                "E:\\Evidencefiles\\dataset_tools\\dict",
-            )),
+            transcriber: Transcriber::new(std::path::Path::new("assets/dict")),
             labels: Vec::new(),
         }
     }

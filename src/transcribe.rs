@@ -37,13 +37,37 @@ impl Transcriber {
         let mandarin = dict_dir.join("mandarin");
         let cantonese = dict_dir.join("cantonese");
 
-        load_phrases(&mandarin.join("phrases_dict.txt"), &mut pinyin_phrases);
-        load_words(&mandarin.join("word.txt"), &mut pinyin_words);
-        load_trans(&mandarin.join("trans_word.txt"), &mut trans);
+        load_phrases(
+            &mandarin.join("phrases_dict.txt"),
+            &mut pinyin_phrases,
+            include_str!("../assets/dict/mandarin/phrases_dict.txt"),
+        );
+        load_words(
+            &mandarin.join("word.txt"),
+            &mut pinyin_words,
+            include_str!("../assets/dict/mandarin/word.txt"),
+        );
+        load_trans(
+            &mandarin.join("trans_word.txt"),
+            &mut trans,
+            include_str!("../assets/dict/mandarin/trans_word.txt"),
+        );
 
-        load_phrases(&cantonese.join("phrases_dict.txt"), &mut cantonese_phrases);
-        load_words(&cantonese.join("word.txt"), &mut cantonese_words);
-        load_trans(&cantonese.join("trans_word.txt"), &mut trans);
+        load_phrases(
+            &cantonese.join("phrases_dict.txt"),
+            &mut cantonese_phrases,
+            include_str!("../assets/dict/cantonese/phrases_dict.txt"),
+        );
+        load_words(
+            &cantonese.join("word.txt"),
+            &mut cantonese_words,
+            include_str!("../assets/dict/cantonese/word.txt"),
+        );
+        load_trans(
+            &cantonese.join("trans_word.txt"),
+            &mut trans,
+            include_str!("../assets/dict/cantonese/trans_word.txt"),
+        );
 
         Self {
             pinyin_phrases,
@@ -121,44 +145,41 @@ fn is_cjk(c: char) -> bool {
     matches!(c as u32, 0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0xF900..=0xFAFF)
 }
 
-fn load_phrases(path: &Path, map: &mut HashMap<String, Vec<String>>) {
-    if let Ok(content) = std::fs::read_to_string(path) {
-        for line in content.lines() {
-            if let Some((key, val)) = line.split_once(':') {
-                let syllables: Vec<String> = val
-                    .split(',')
-                    .map(|s| strip_tone(s.trim()).to_string())
-                    .collect();
-                if !syllables.is_empty() {
-                    map.insert(key.to_string(), syllables);
-                }
+fn load_phrases(path: &Path, map: &mut HashMap<String, Vec<String>>, embedded: &str) {
+    let content = std::fs::read_to_string(path).unwrap_or_else(|_| embedded.to_string());
+    for line in content.lines() {
+        if let Some((key, val)) = line.split_once(':') {
+            let syllables: Vec<String> = val
+                .split(',')
+                .map(|s| strip_tone(s.trim()).to_string())
+                .collect();
+            if !syllables.is_empty() {
+                map.insert(key.to_string(), syllables);
             }
         }
     }
 }
 
-fn load_words(path: &Path, map: &mut HashMap<String, Vec<String>>) {
-    if let Ok(content) = std::fs::read_to_string(path) {
-        for line in content.lines() {
-            if let Some((key, val)) = line.split_once(':') {
-                let syllables: Vec<String> = val
-                    .split(',')
-                    .map(|s| strip_tone(s.trim()).to_string())
-                    .collect();
-                if !syllables.is_empty() {
-                    map.insert(key.to_string(), syllables);
-                }
+fn load_words(path: &Path, map: &mut HashMap<String, Vec<String>>, embedded: &str) {
+    let content = std::fs::read_to_string(path).unwrap_or_else(|_| embedded.to_string());
+    for line in content.lines() {
+        if let Some((key, val)) = line.split_once(':') {
+            let syllables: Vec<String> = val
+                .split(',')
+                .map(|s| strip_tone(s.trim()).to_string())
+                .collect();
+            if !syllables.is_empty() {
+                map.insert(key.to_string(), syllables);
             }
         }
     }
 }
 
-fn load_trans(path: &Path, map: &mut HashMap<String, String>) {
-    if let Ok(content) = std::fs::read_to_string(path) {
-        for line in content.lines() {
-            if let Some((key, val)) = line.split_once(':') {
-                map.insert(key.to_string(), val.trim().to_string());
-            }
+fn load_trans(path: &Path, map: &mut HashMap<String, String>, embedded: &str) {
+    let content = std::fs::read_to_string(path).unwrap_or_else(|_| embedded.to_string());
+    for line in content.lines() {
+        if let Some((key, val)) = line.split_once(':') {
+            map.insert(key.to_string(), val.trim().to_string());
         }
     }
 }
