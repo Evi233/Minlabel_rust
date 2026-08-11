@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -287,11 +288,11 @@ impl MinlabelApp {
                 } else {
                     for name in devices {
                         let selected = self.player.device.as_deref() == Some(name.as_str());
-                        if ui.selectable_label(selected, name).clicked() {
+                        if ui.selectable_label(selected, &name).clicked() {
                             self.player.set_device(&name);
                             if self.playing {
-                                if let Some(file) = self.current_file() {
-                                    let _ = self.player.play(file);
+                                if let Some(file) = self.current_file().cloned() {
+                                    let _ = self.player.play(&file);
                                 }
                             }
                             ui.close();
