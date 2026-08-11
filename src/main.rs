@@ -266,8 +266,8 @@ impl MinlabelApp {
         let mut pos = self.player.position_secs();
         let slider = egui::Slider::new(&mut pos, 0.0..=duration.max(0.001))
             .show_value(false)
-            .trailing_fill(true)
-            .fill_width(true);
+            .trailing_fill(true);
+        ui.spacing_mut().slider_width = ui.available_width();
         if ui.add(slider).changed() {
             self.player.seek(pos);
         }
@@ -392,7 +392,7 @@ impl Player {
         let config = device
             .default_output_config()
             .map_err(|e| e.to_string())?;
-        let device_sample_rate = config.sample_rate().0;
+        let device_sample_rate = config.sample_rate();
         let device_channels = config.channels() as usize;
 
         let samples = if file_sample_rate == device_sample_rate {
