@@ -32,7 +32,8 @@ struct MinlabelApp {
 }
 
 impl MinlabelApp {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        setup_fonts(&cc.egui_ctx);
         Self {
             folder: None,
             files: Vec::new(),
@@ -262,7 +263,10 @@ impl MinlabelApp {
         let slider = egui::Slider::new(&mut pos, 0.0..=duration.max(0.001))
             .show_value(false)
             .trailing_fill(true);
-        if ui.add(slider).changed() {
+        if ui
+            .add_sized([ui.available_width(), 20.0], slider)
+            .changed()
+        {
             self.player.seek(pos);
         }
         ui.add_space(4.0);
@@ -469,4 +473,33 @@ impl Player {
 fn format_time(secs: f64) -> String {
     let secs = secs.max(0.0) as u64;
     format!("{:02}:{:02}", secs / 60, secs % 60)
+}
+
+fn setup_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "NotoSansSC".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/NotoSansSC-Regular.otf"
+        ))),
+    );
+    fonts.font_data.insert(
+        "NotoEmoji".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/NotoEmoji-Regular.ttf"
+        ))),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .insert(0, "NotoSansSC".to_owned());
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .push("NotoEmoji".to_owned());
+    }
+    ctx.set_fonts(fonts);
 }
