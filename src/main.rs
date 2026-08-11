@@ -574,7 +574,7 @@ impl MinlabelApp {
             .auto_shrink(false)
             .show(ui, |ui| {
                 ui.add_sized(
-                    [ui.available_width(), ui.available_height()],
+                    [ui.available_width(), (ui.available_height() - 30.0).max(60.0)],
                     egui::TextEdit::multiline(&mut self.annotation_text)
                         .hint_text("Annotation text"),
                 );
