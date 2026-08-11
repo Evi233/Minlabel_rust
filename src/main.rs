@@ -390,7 +390,6 @@ impl Player {
         let samples = Arc::clone(&self.samples);
         let position = Arc::clone(&self.position);
         let playing = Arc::clone(&self.playing);
-        let channels = channels as usize;
 
         let host = cpal::default_host();
         let device = host
@@ -404,7 +403,7 @@ impl Player {
             .build_output_stream(
                 config.into(),
                 move |data: &mut [f32], _| {
-                    let mut samples = samples.lock().unwrap();
+                    let samples = samples.lock().unwrap();
                     let pos = position.load(Ordering::SeqCst) as usize;
                     if !playing.load(Ordering::SeqCst) {
                         for s in data.iter_mut() {
@@ -490,16 +489,9 @@ fn setup_fonts(ctx: &egui::Context) {
         ))),
     );
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .insert(0, "NotoSansSC".to_owned());
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .push("NotoEmoji".to_owned());
+        let list = fonts.families.entry(family).or_default();
+        list.insert(0, "NotoSansSC".to_owned());
+        list.push("NotoEmoji".to_owned());
     }
     ctx.set_fonts(fonts);
 }
