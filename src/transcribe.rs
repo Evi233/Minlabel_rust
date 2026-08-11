@@ -1,10 +1,21 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Pinyin,
     Romaji,
     Cantonese,
+}
+
+impl Mode {
+    pub fn to_string(&self) -> &'static str {
+        match self {
+            Mode::Pinyin => "pinyin",
+            Mode::Romaji => "romaji",
+            Mode::Cantonese => "cantonese",
+        }
+    }
 }
 
 pub struct Transcriber {

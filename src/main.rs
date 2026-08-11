@@ -351,7 +351,7 @@ impl MinlabelApp {
         self.save_outputs();
     }
 
-    fn save_outputs(&self) {
+    fn save_outputs(&mut self) {
         let Some(file) = self.current_file() else {
             self.status = "No file selected".to_string();
             return;
