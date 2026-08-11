@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use serde::{Deserialize, Serialize};
 
 mod net;
 mod transcribe;
@@ -248,45 +247,51 @@ impl MinlabelApp {
     }
 
     fn poll_net(&mut self) {
-        let Some(net) = &self.net else { return };
-        let events = net.events.lock().unwrap();
-        while let Ok(evt) = events.try_recv() {
-            match evt {
-                NetEvent::Connected => {
-                    self.status = "Connected".to_string();
-                }
-                NetEvent::Disconnected(reason) => {
-                    self.status = format!("Disconnected: {reason}");
-                    self.net = None;
-                    self.locks.clear();
-                }
-                NetEvent::Presence { user, file_id } => {
-                    self.locks.insert(file_id, user.clone());
-                    if self.current_file_id() == Some(file_id) {
-                        self.status = format!("{user} is annotating this file");
+        let mut disconnected = None;
+        {
+            let Some(net) = &self.net else { return };
+            let events = net.events.lock().unwrap();
+            while let Ok(evt) = events.try_recv() {
+                match evt {
+                    NetEvent::Connected => {
+                        self.status = "Connected".to_string();
                     }
-                }
-                NetEvent::Released { user: _, file_id } => {
-                    self.locks.remove(&file_id);
-                }
-                NetEvent::Annotated { user: _, file_id, data } => {
-                    if let Some(i) = self.files.iter().position(|f| {
-                        self.file_ids
-                            .get(&f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default())
-                            == Some(&file_id)
-                    }) {
-                        if i < self.labels.len() {
-                            self.labels[i] = data;
+                    NetEvent::Disconnected(reason) => {
+                        disconnected = Some(reason);
+                    }
+                    NetEvent::Presence { user, file_id } => {
+                        self.locks.insert(file_id, user.clone());
+                        if self.current_file_id() == Some(file_id) {
+                            self.status = format!("{user} is annotating this file");
                         }
                     }
-                }
-                NetEvent::Progress { done, total } => {
-                    self.remote_progress = Some((done, total));
-                }
-                NetEvent::Error(msg) => {
-                    self.status = format!("Net error: {msg}");
+                    NetEvent::Released { user: _, file_id } => {
+                        self.locks.remove(&file_id);
+                    }
+                    NetEvent::Annotated { user: _, file_id, data } => {
+                        if let Some(i) = self.files.iter().position(|f| {
+                            self.file_ids
+                                .get(&f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default())
+                                == Some(&file_id)
+                        }) {
+                            if i < self.labels.len() {
+                                self.labels[i] = data;
+                            }
+                        }
+                    }
+                    NetEvent::Progress { done, total } => {
+                        self.remote_progress = Some((done, total));
+                    }
+                    NetEvent::Error(msg) => {
+                        self.status = format!("Net error: {msg}");
+                    }
                 }
             }
+        }
+        if let Some(reason) = disconnected {
+            self.status = format!("Disconnected: {reason}");
+            self.net = None;
+            self.locks.clear();
         }
     }
 
@@ -425,7 +430,7 @@ impl eframe::App for MinlabelApp {
                             let fid = file_ids.get(&name).copied();
                             let locked_by = fid.and_then(|id| locks.get(&id).cloned());
                             ui.horizontal(|ui| {
-                                if let Some(user) = &locked_by {
+                                if locked_by.is_some() {
                                     ui.colored_label(egui::Color32::YELLOW, "\u{25CF}");
                                 }
                                 let text = if checked {
@@ -560,10 +565,6 @@ impl MinlabelApp {
         ui.add_space(4.0);
         match self.current_file() {
             Some(file) => {
-                let name = file
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
                 if let Some(user) = self
                     .current_file_id()
                     .and_then(|id| self.locks.get(&id).cloned())
