@@ -7,27 +7,13 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
+mod transcribe;
+use transcribe::{Mode, Transcriber};
+
 const ICON_PLAY: char = '\u{e037}';
 const ICON_PAUSE: char = '\u{e034}';
 const ICON_HEADPHONES: char = '\u{f01f}';
 const ICON_PASTE: char = '\u{e14f}';
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Pinyin,
-    Romaji,
-    Cantonese,
-}
-
-impl Mode {
-    fn to_string(&self) -> &'static str {
-        match self {
-            Mode::Pinyin => "pinyin",
-            Mode::Romaji => "romaji",
-            Mode::Cantonese => "cantonese",
-        }
-    }
-}
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -56,6 +42,7 @@ struct MinlabelApp {
     paste_text: String,
     annotation_text: String,
     mode: Mode,
+    transcriber: Transcriber,
 }
 
 impl MinlabelApp {
@@ -74,6 +61,9 @@ impl MinlabelApp {
             paste_text: String::new(),
             annotation_text: String::new(),
             mode: Mode::Pinyin,
+            transcriber: Transcriber::new(std::path::Path::new(
+                "E:\\Evidencefiles\\dataset_tools\\dict",
+            )),
         }
     }
 
@@ -345,6 +335,55 @@ impl eframe::App for MinlabelApp {
 }
 
 impl MinlabelApp {
+    fn apply_text(&mut self, append: bool) {
+        let text = self.paste_text.trim().to_string();
+        if text.is_empty() {
+            self.status = "Input text is empty".to_string();
+            return;
+        }
+        let transcribed = self.transcriber.transcribe(&text, &self.mode);
+        if append && !self.annotation_text.is_empty() {
+            self.annotation_text.push('\n');
+        }
+        self.annotation_text = transcribed;
+        self.paste_text.clear();
+        self.status = format!("Transcribed ({})", self.mode.to_string());
+        self.save_outputs();
+    }
+
+    fn save_outputs(&self) {
+        let Some(file) = self.current_file() else {
+            self.status = "No file selected".to_string();
+            return;
+        };
+        let Some(folder) = &self.folder else {
+            return;
+        };
+        let stem = file
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let json_path = folder.join(format!("{stem}.json"));
+        let lab_path = folder.join(format!("{stem}.lab"));
+
+        let lab = self.annotation_text.trim();
+        let json = format!(
+            "{{\n    \"isCheck\": true,\n    \"lab\": \"{}\",\n    \"lab_without_tone\": \"{}\",\n    \"raw_text\": \"{}\"\n}}",
+            lab,
+            lab,
+            self.paste_text.trim()
+        );
+        if let Err(e) = std::fs::write(&json_path, json) {
+            self.status = format!("Failed to write json: {e}");
+            return;
+        }
+        if let Err(e) = std::fs::write(&lab_path, lab) {
+            self.status = format!("Failed to write lab: {e}");
+            return;
+        }
+        self.status = format!("Saved {} and {}", json_path.display(), lab_path.display());
+    }
+
     fn player_ui(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
         match self.current_file() {
@@ -433,8 +472,9 @@ impl MinlabelApp {
                 .min_size(egui::vec2(30.0, 24.0));
             let resp = ui.add_sized(
                 [ui.available_width() - 34.0, 24.0],
-                egui::TextEdit::singleline(&mut self.paste_text).hint_text("Paste text here"),
+                egui::TextEdit::singleline(&mut self.paste_text).hint_text("Input text here"),
             );
+            let submitted = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if resp.changed() {
                 self.paste_text = self.paste_text.replace('\n', "");
             }
@@ -449,6 +489,9 @@ impl MinlabelApp {
                     self.paste_text = text;
                 }
             }
+            if submitted {
+                self.apply_text(false);
+            }
         });
 
         ui.add_space(4.0);
@@ -459,13 +502,13 @@ impl MinlabelApp {
                 .add_sized([btn_w, 26.0], egui::Button::new("Replace"))
                 .clicked()
             {
-                self.status = "Replace clicked".to_string();
+                self.apply_text(false);
             }
             if ui
                 .add_sized([btn_w, 26.0], egui::Button::new("Append"))
                 .clicked()
             {
-                self.status = "Append clicked".to_string();
+                self.apply_text(true);
             }
             egui::ComboBox::from_id_salt("mode_combo")
                 .selected_text(self.mode.to_string())
