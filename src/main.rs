@@ -18,6 +18,18 @@ const ICON_PAUSE: char = '\u{e034}';
 const ICON_HEADPHONES: char = '\u{f01f}';
 const ICON_PASTE: char = '\u{e14f}';
 
+/// Append a line to %TEMP%/minlabel-client.log for diagnostics.
+fn log_line(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::env::temp_dir().join("minlabel-client.log"))
+    {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -231,6 +243,10 @@ impl MinlabelApp {
         self.current_audio = None;
         if self.net.is_some() {
             if let Some(info) = self.room_files.get(self.current_index).cloned() {
+                log_line(&format!(
+                    "select file id={} name={} uploaded={} owner={:?}",
+                    info.id, info.name, info.uploaded, info.owner
+                ));
                 let cached = self.cache_dir.join(&info.name);
                 if cached.exists() {
                     self.current_audio = Some(cached);
@@ -279,10 +295,19 @@ impl MinlabelApp {
         // We own this file: play the local copy directly, and upload it for
         // the room if it is not on the server yet.
         if info.owner.as_deref() == Some(user.as_str()) {
+            log_line(&format!(
+                "ensure_current_audio: id={} is mine (owner matches)",
+                info.id
+            ));
             let Some(src) = self.files.iter().find(|f| {
                 f.file_name().map(|n| n.to_string_lossy().to_string()) == Some(info.name.clone())
             }) else {
                 self.status = format!("Local file {} not found in opened folder", info.name);
+                log_line(&format!(
+                    "ensure_current_audio: id={} local file not found, {} local files",
+                    info.id,
+                    self.files.len()
+                ));
                 return;
             };
             self.current_audio = Some(src.clone());
@@ -307,6 +332,10 @@ impl MinlabelApp {
         // File not on the server yet: ask its owner to upload. This is not
         // gated on `busy`, so repeated clicks always re-send the request.
         if !info.uploaded {
+            log_line(&format!(
+                "ensure_current_audio: id={} not uploaded, sending request_file",
+                info.id
+            ));
             net.request_file(info.id);
             let owner = info.owner.clone().unwrap_or_else(|| "?".to_string());
             self.status = format!("Requesting {} from {owner}...", info.name);
@@ -314,10 +343,18 @@ impl MinlabelApp {
         }
 
         if self.busy || self.pending_download.is_some() || self.pending_upload.is_some() {
+            log_line(&format!(
+                "ensure_current_audio: id={} uploaded but busy={} pd={:?} pu={:?}",
+                info.id, self.busy, self.pending_download, self.pending_upload
+            ));
             return;
         }
         self.busy = true;
         self.pending_download = Some(info.id);
+        log_line(&format!(
+            "ensure_current_audio: id={} uploaded, starting download",
+            info.id
+        ));
         let tx = self.io_tx.clone();
         std::thread::spawn(
             move || match net::fetch_audio(&server, http_port, info.id, &dest) {
@@ -339,10 +376,18 @@ impl MinlabelApp {
 
     /// A room member asked for a file we own: upload it on demand.
     fn handle_file_requested(&mut self, file_id: u32) {
+        log_line(&format!("handle_file_requested: file_id={file_id}"));
         let Some(info) = self.room_files.iter().find(|f| f.id == file_id).cloned() else {
+            log_line(&format!(
+                "handle_file_requested: file_id={file_id} not in room_files ({} entries)",
+                self.room_files.len()
+            ));
             return;
         };
-        let Some(net) = &self.net else { return };
+        let Some(net) = &self.net else {
+            log_line("handle_file_requested: net is None");
+            return;
+        };
         // If the owner field is missing (e.g. a room registered by an older
         // server), still try to upload: the server rejects non-owners with 403.
         if info
@@ -350,6 +395,10 @@ impl MinlabelApp {
             .as_deref()
             .is_some_and(|o| o != net.username.as_str())
         {
+            log_line(&format!(
+                "handle_file_requested: id={} owner={:?} != user={}",
+                file_id, info.owner, net.username
+            ));
             return;
         }
         let Some(src) = self.files.iter().find(|f| {
@@ -359,6 +408,12 @@ impl MinlabelApp {
                 "Peer requested {} but it is not in the opened folder",
                 info.name
             );
+            log_line(&format!(
+                "handle_file_requested: id={} name={} not in local folder ({} files)",
+                file_id,
+                info.name,
+                self.files.len()
+            ));
             return;
         };
         let server = self.room_info.server.clone();
@@ -368,6 +423,11 @@ impl MinlabelApp {
         let src = src.clone();
         self.pending_upload = Some(file_id);
         let tx = self.io_tx.clone();
+        log_line(&format!(
+            "handle_file_requested: id={} uploading {}",
+            file_id,
+            src.display()
+        ));
         std::thread::spawn(move || {
             let r = net::upload_audio(&server, http_port, &room, &user, file_id, &src);
             let _ = tx.send(IoEvent::UploadDone {
@@ -524,6 +584,10 @@ impl MinlabelApp {
             self.status = "Username and room code are required".to_string();
             return;
         }
+        log_line(&format!(
+            "do_join_room: server={} ws_port={} http_port={} user={} room={}",
+            info.server, info.port, info.http_port, info.username, info.room
+        ));
         self.status = format!("Joining room {}...", info.room);
         self.busy = true;
         let tx = self.io_tx.clone();
@@ -578,9 +642,11 @@ impl MinlabelApp {
                     self.remote_progress = Some((done, total));
                 }
                 NetEvent::FileRequested { file_id } => {
+                    log_line(&format!("net event: file_requested {file_id}"));
                     self.handle_file_requested(file_id);
                 }
                 NetEvent::FileUploaded { file_id } => {
+                    log_line(&format!("net event: file_uploaded {file_id}"));
                     if let Some(f) = self.room_files.iter_mut().find(|f| f.id == file_id) {
                         f.uploaded = true;
                     }
@@ -589,6 +655,7 @@ impl MinlabelApp {
                     }
                 }
                 NetEvent::FileReady { file_id } => {
+                    log_line(&format!("net event: file_ready {file_id}"));
                     if let Some(f) = self.room_files.iter_mut().find(|f| f.id == file_id) {
                         f.uploaded = true;
                     }
@@ -597,6 +664,7 @@ impl MinlabelApp {
                     }
                 }
                 NetEvent::FileUnavailable { file_id } => {
+                    log_line(&format!("net event: file_unavailable {file_id}"));
                     if self.current_file_id() == Some(file_id) {
                         self.status = format!("File {file_id} is unavailable (owner offline)");
                     }
@@ -672,6 +740,10 @@ impl MinlabelApp {
                 IoEvent::DownloadDone { file_id, path } => {
                     self.busy = false;
                     self.pending_download = None;
+                    log_line(&format!(
+                        "io event: download_done {file_id} -> {}",
+                        path.display()
+                    ));
                     if let Some(f) = self.room_files.iter_mut().find(|f| f.id == file_id) {
                         f.uploaded = true;
                     }
@@ -685,11 +757,15 @@ impl MinlabelApp {
                 IoEvent::DownloadFailed { file_id, msg } => {
                     self.busy = false;
                     self.pending_download = None;
+                    log_line(&format!("io event: download_failed {file_id}: {msg}"));
                     self.status = format!("Download failed for file {file_id}: {msg}");
                 }
                 IoEvent::UploadDone { file_id, ok, msg } => {
                     self.busy = false;
                     self.pending_upload = None;
+                    log_line(&format!(
+                        "io event: upload_done {file_id} ok={ok} msg={msg}"
+                    ));
                     if ok {
                         if let Some(f) = self.room_files.iter_mut().find(|f| f.id == file_id) {
                             f.uploaded = true;
