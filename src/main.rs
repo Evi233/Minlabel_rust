@@ -304,34 +304,37 @@ impl MinlabelApp {
             return;
         }
 
-        if self.busy || self.pending_download.is_some() || self.pending_upload.is_some() {
-            return;
-        }
-        if info.uploaded {
-            self.busy = true;
-            self.pending_download = Some(info.id);
-            let tx = self.io_tx.clone();
-            std::thread::spawn(move || {
-                match net::fetch_audio(&server, http_port, info.id, &dest) {
-                    Ok(()) => {
-                        let _ = tx.send(IoEvent::DownloadDone {
-                            file_id: info.id,
-                            path: dest,
-                        });
-                    }
-                    Err(e) => {
-                        let _ = tx.send(IoEvent::DownloadFailed {
-                            file_id: info.id,
-                            msg: e,
-                        });
-                    }
-                }
-            });
-        } else {
+        // File not on the server yet: ask its owner to upload. This is not
+        // gated on `busy`, so repeated clicks always re-send the request.
+        if !info.uploaded {
             net.request_file(info.id);
             let owner = info.owner.clone().unwrap_or_else(|| "?".to_string());
             self.status = format!("Requesting {} from {owner}...", info.name);
+            return;
         }
+
+        if self.busy || self.pending_download.is_some() || self.pending_upload.is_some() {
+            return;
+        }
+        self.busy = true;
+        self.pending_download = Some(info.id);
+        let tx = self.io_tx.clone();
+        std::thread::spawn(
+            move || match net::fetch_audio(&server, http_port, info.id, &dest) {
+                Ok(()) => {
+                    let _ = tx.send(IoEvent::DownloadDone {
+                        file_id: info.id,
+                        path: dest,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(IoEvent::DownloadFailed {
+                        file_id: info.id,
+                        msg: e,
+                    });
+                }
+            },
+        );
     }
 
     /// A room member asked for a file we own: upload it on demand.
@@ -340,7 +343,13 @@ impl MinlabelApp {
             return;
         };
         let Some(net) = &self.net else { return };
-        if info.owner.as_deref() != Some(net.username.as_str()) {
+        // If the owner field is missing (e.g. a room registered by an older
+        // server), still try to upload: the server rejects non-owners with 403.
+        if info
+            .owner
+            .as_deref()
+            .is_some_and(|o| o != net.username.as_str())
+        {
             return;
         }
         let Some(src) = self.files.iter().find(|f| {
@@ -557,7 +566,16 @@ impl MinlabelApp {
                 NetEvent::Presence { user, file_id } => {
                     self.locks.insert(file_id, user.clone());
                     if self.current_file_id() == Some(file_id) {
-                        self.status = format!("{user} is annotating this file");
+                        // Our own claim echoes back; don't clobber the
+                        // "Requesting ..." status with it.
+                        let mine = self
+                            .net
+                            .as_ref()
+                            .map(|n| n.username == user)
+                            .unwrap_or(false);
+                        if !mine {
+                            self.status = format!("{user} is annotating this file");
+                        }
                     }
                 }
                 NetEvent::Released { file_id } => {
@@ -628,6 +646,8 @@ impl MinlabelApp {
                     self.net = Some(client);
                     self.room_files = files;
                     self.labels = vec![LabelData::default(); self.room_files.len()];
+                    self.current_index = 0;
+                    self.current_audio = None;
                     self.locks.clear();
                     self.busy = false;
                     self.remote_progress = None;
@@ -640,6 +660,8 @@ impl MinlabelApp {
                     self.net = Some(client);
                     self.room_files = files;
                     self.labels = vec![LabelData::default(); self.room_files.len()];
+                    self.current_index = 0;
+                    self.current_audio = None;
                     self.locks.clear();
                     self.busy = false;
                     self.remote_progress = None;
