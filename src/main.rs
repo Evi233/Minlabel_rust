@@ -467,6 +467,7 @@ impl MinlabelApp {
             self.status = "Username is required".to_string();
             return;
         }
+        self.status = "Creating room...".to_string();
         // Register the opened folder's files (metadata only) with the new room.
         let folder_files: Vec<(String, u64)> = self
             .files
@@ -519,6 +520,7 @@ impl MinlabelApp {
             self.status = "Username and room code are required".to_string();
             return;
         }
+        self.status = format!("Joining room {}...", info.room);
         self.busy = true;
         let tx = self.io_tx.clone();
         std::thread::spawn(move || {

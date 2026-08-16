@@ -194,10 +194,19 @@ impl NetClient {
                 }
             };
             rt.block_on(async move {
-                let (mut ws, _) = match tokio_tungstenite::connect_async(&url).await {
-                    Ok(pair) => pair,
-                    Err(e) => {
+                let (mut ws, _) = match tokio::time::timeout(
+                    HTTP_TIMEOUT,
+                    tokio_tungstenite::connect_async(&url),
+                )
+                .await
+                {
+                    Ok(Ok(pair)) => pair,
+                    Ok(Err(e)) => {
                         let _ = evt_tx.send(NetEvent::Error(format!("Connect: {e}")));
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = evt_tx.send(NetEvent::Error("Connect: timed out".to_string()));
                         return;
                     }
                 };
@@ -279,10 +288,19 @@ impl NetClient {
 // ---------------------------------------------------------------------------
 // Blocking HTTP helpers (run on background threads)
 
+const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn http_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .unwrap_or_default()
+}
+
 /// Create a room; returns the 6-character room code.
 pub fn create_room(server: &str, http_port: u16, user: &str) -> Result<String, String> {
     let url = format!("http://{server}:{http_port}/api/rooms");
-    let resp = reqwest::blocking::Client::new()
+    let resp = http_client()
         .post(&url)
         .json(&serde_json::json!({ "user": user }))
         .send()
@@ -308,7 +326,7 @@ pub fn register_files(
         .iter()
         .map(|(name, size)| serde_json::json!({ "name": name, "size": size }))
         .collect();
-    let resp = reqwest::blocking::Client::new()
+    let resp = http_client()
         .post(&url)
         .json(&serde_json::json!({ "user": user, "files": list }))
         .send()
@@ -325,7 +343,7 @@ pub fn register_files(
 
 pub fn fetch_room_files(server: &str, http_port: u16, room: &str) -> Result<Vec<FileInfo>, String> {
     let url = format!("http://{server}:{http_port}/api/rooms/{room}/files");
-    let resp = reqwest::blocking::get(&url).map_err(|e| e.to_string())?;
+    let resp = http_client().get(&url).send().map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("list files failed: {}", resp.status()));
     }
@@ -359,7 +377,7 @@ pub fn upload_audio(
                 .map_err(|e| e.to_string())?
                 .file_name(name),
         );
-    let resp = reqwest::blocking::Client::new()
+    let resp = http_client()
         .post(&url)
         .multipart(form)
         .send()
@@ -378,7 +396,7 @@ pub fn fetch_audio(
     dest: &std::path::Path,
 ) -> Result<(), String> {
     let url = format!("http://{server}:{http_port}/api/files/{file_id}/audio");
-    let resp = reqwest::blocking::get(&url).map_err(|e| e.to_string())?;
+    let resp = http_client().get(&url).send().map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("download failed: {}", resp.status()));
     }
