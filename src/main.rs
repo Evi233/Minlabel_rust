@@ -2,14 +2,15 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
-use eframe::egui;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use eframe::egui;
 
 mod net;
 mod transcribe;
-use net::{ConnectInfo, LabelData, NetClient, NetEvent};
+use net::{ConnectInfo, FileInfo, IoEvent, LabelData, NetClient, NetEvent};
 use transcribe::{Mode, Transcriber};
 
 const ICON_PLAY: char = '\u{e037}';
@@ -35,6 +36,8 @@ struct MinlabelApp {
     folder: Option<PathBuf>,
     files: Vec<PathBuf>,
     current_index: usize,
+    /// Path of the currently selected audio (local file or cached download).
+    current_audio: Option<PathBuf>,
     playing: bool,
     show_about: bool,
     status: String,
@@ -46,22 +49,30 @@ struct MinlabelApp {
     mode: Mode,
     transcriber: Transcriber,
     labels: Vec<LabelData>,
-    show_connect: bool,
-    connect_info: ConnectInfo,
+    show_room: bool,
+    room_info: ConnectInfo,
     net: Option<NetClient>,
     locks: std::collections::HashMap<u32, String>,
-    remote_files: Vec<net::FileInfo>,
-    file_ids: std::collections::HashMap<String, u32>,
+    room_files: Vec<FileInfo>,
+    room_code: String,
     remote_progress: Option<(u32, u32)>,
+    io_events: Arc<Mutex<Receiver<IoEvent>>>,
+    io_tx: std::sync::mpsc::Sender<IoEvent>,
+    busy: bool,
+    pending_download: Option<u32>,
+    pending_upload: Option<u32>,
+    cache_dir: PathBuf,
 }
 
 impl MinlabelApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         setup_fonts(&cc.egui_ctx);
+        let (io_tx, io_rx) = std::sync::mpsc::channel::<IoEvent>();
         Self {
             folder: None,
             files: Vec::new(),
             current_index: 0,
+            current_audio: None,
             playing: false,
             show_about: false,
             status: String::new(),
@@ -73,13 +84,19 @@ impl MinlabelApp {
             mode: Mode::Pinyin,
             transcriber: Transcriber::new(std::path::Path::new("assets/dict")),
             labels: Vec::new(),
-            show_connect: false,
-            connect_info: ConnectInfo::default(),
+            show_room: false,
+            room_info: ConnectInfo::default(),
             net: None,
             locks: std::collections::HashMap::new(),
-            remote_files: Vec::new(),
-            file_ids: std::collections::HashMap::new(),
+            room_files: Vec::new(),
+            room_code: String::new(),
             remote_progress: None,
+            io_events: Arc::new(Mutex::new(io_rx)),
+            io_tx,
+            busy: false,
+            pending_download: None,
+            pending_upload: None,
+            cache_dir: std::env::temp_dir().join("minlabel-cache"),
         }
     }
 
@@ -89,10 +106,11 @@ impl MinlabelApp {
             self.files = Self::collect_files(&path);
             self.labels = vec![LabelData::default(); self.files.len()];
             self.current_index = 0;
-            self.playing = false;
-            self.player.stop();
-            self.load_current_label();
+            self.activate_index();
             self.status = format!("Opened folder: {}", path.display());
+            if self.net.is_some() {
+                self.register_folder();
+            }
         }
     }
 
@@ -100,6 +118,9 @@ impl MinlabelApp {
         let Some(file) = self.current_file() else {
             return;
         };
+        if self.current_index >= self.labels.len() {
+            return;
+        }
         let stem = file
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
@@ -118,6 +139,9 @@ impl MinlabelApp {
         let Some(file) = self.current_file() else {
             return;
         };
+        if self.current_index >= self.labels.len() {
+            return;
+        }
         let stem = file
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
@@ -163,37 +187,256 @@ impl MinlabelApp {
     }
 
     fn next_file(&mut self) {
-        if self.files.is_empty() {
+        let len = if self.net.is_some() {
+            self.room_files.len()
+        } else {
+            self.files.len()
+        };
+        if len == 0 {
             return;
         }
         self.save_current_label();
-        self.current_index = (self.current_index + 1) % self.files.len();
-        self.playing = false;
-        self.player.stop();
-        self.load_current_label();
+        self.release_previous_claim();
+        self.current_index = (self.current_index + 1) % len;
+        self.activate_index();
     }
 
     fn previous_file(&mut self) {
-        if self.files.is_empty() {
+        let len = if self.net.is_some() {
+            self.room_files.len()
+        } else {
+            self.files.len()
+        };
+        if len == 0 {
             return;
         }
         self.save_current_label();
-        self.current_index = (self.current_index + self.files.len() - 1) % self.files.len();
+        self.release_previous_claim();
+        self.current_index = (self.current_index + len - 1) % len;
+        self.activate_index();
+    }
+
+    fn select_file(&mut self, i: usize) {
+        self.save_current_label();
+        self.release_previous_claim();
+        self.current_index = i;
+        self.activate_index();
+    }
+
+    /// Apply the current index: load the audio (local file, cached download,
+    /// or trigger an on-demand download/upload) and load its label.
+    fn activate_index(&mut self) {
         self.playing = false;
         self.player.stop();
+        self.current_audio = None;
+        if self.net.is_some() {
+            if let Some(info) = self.room_files.get(self.current_index).cloned() {
+                let cached = self.cache_dir.join(&info.name);
+                if cached.exists() {
+                    self.current_audio = Some(cached);
+                }
+                self.net.as_ref().unwrap().claim(info.id);
+                self.ensure_current_audio();
+            }
+        } else if let Some(f) = self.files.get(self.current_index) {
+            self.current_audio = Some(f.clone());
+        }
         self.load_current_label();
     }
 
-    fn toggle_play(&mut self) {
-        if self.files.is_empty() {
-            self.status = "No files loaded. Open a folder first.".to_string();
+    /// Release the claim on the previously selected file, if we hold it.
+    fn release_previous_claim(&mut self) {
+        let Some(net) = &self.net else { return };
+        let Some(prev) = self.room_files.get(self.current_index) else {
+            return;
+        };
+        if self
+            .locks
+            .get(&prev.id)
+            .map(|u| u == &net.username)
+            .unwrap_or(false)
+        {
+            net.release(prev.id);
+            self.locks.remove(&prev.id);
+        }
+    }
+
+    /// Make sure the current file's audio is available locally: download it if
+    /// the server has it, upload it if we own it, otherwise ask the owner.
+    fn ensure_current_audio(&mut self) {
+        if self.current_audio.is_some() {
             return;
         }
+        let Some(net) = &self.net else { return };
+        let Some(info) = self.room_files.get(self.current_index).cloned() else {
+            return;
+        };
+        let server = self.room_info.server.clone();
+        let http_port = self.room_info.http_port;
+        let user = net.username.clone();
+        let dest = self.cache_dir.join(&info.name);
+
+        // We own this file: play the local copy directly, and upload it for
+        // the room if it is not on the server yet.
+        if info.owner.as_deref() == Some(user.as_str()) {
+            let Some(src) = self.files.iter().find(|f| {
+                f.file_name().map(|n| n.to_string_lossy().to_string()) == Some(info.name.clone())
+            }) else {
+                self.status = format!("Local file {} not found in opened folder", info.name);
+                return;
+            };
+            self.current_audio = Some(src.clone());
+            if !info.uploaded && !self.busy && self.pending_upload.is_none() {
+                self.busy = true;
+                self.pending_upload = Some(info.id);
+                let src = src.clone();
+                let room = self.room_info.room.clone();
+                let tx = self.io_tx.clone();
+                std::thread::spawn(move || {
+                    let r = net::upload_audio(&server, http_port, &room, &user, info.id, &src);
+                    let _ = tx.send(IoEvent::UploadDone {
+                        file_id: info.id,
+                        ok: r.is_ok(),
+                        msg: r.unwrap_or_default(),
+                    });
+                });
+            }
+            return;
+        }
+
+        if self.busy || self.pending_download.is_some() || self.pending_upload.is_some() {
+            return;
+        }
+        if info.uploaded {
+            self.busy = true;
+            self.pending_download = Some(info.id);
+            let tx = self.io_tx.clone();
+            std::thread::spawn(move || {
+                match net::fetch_audio(&server, http_port, info.id, &dest) {
+                    Ok(()) => {
+                        let _ = tx.send(IoEvent::DownloadDone {
+                            file_id: info.id,
+                            path: dest,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(IoEvent::DownloadFailed {
+                            file_id: info.id,
+                            msg: e,
+                        });
+                    }
+                }
+            });
+        } else {
+            net.request_file(info.id);
+            let owner = info.owner.clone().unwrap_or_else(|| "?".to_string());
+            self.status = format!("Requesting {} from {owner}...", info.name);
+        }
+    }
+
+    /// A room member asked for a file we own: upload it on demand.
+    fn handle_file_requested(&mut self, file_id: u32) {
+        let Some(info) = self.room_files.iter().find(|f| f.id == file_id).cloned() else {
+            return;
+        };
+        let Some(net) = &self.net else { return };
+        if info.owner.as_deref() != Some(net.username.as_str()) {
+            return;
+        }
+        let Some(src) = self.files.iter().find(|f| {
+            f.file_name().map(|n| n.to_string_lossy().to_string()) == Some(info.name.clone())
+        }) else {
+            self.status = format!(
+                "Peer requested {} but it is not in the opened folder",
+                info.name
+            );
+            return;
+        };
+        if self.busy || self.pending_upload.is_some() {
+            self.status = format!("Busy; will upload {} later", info.name);
+            return;
+        }
+        let server = self.room_info.server.clone();
+        let http_port = self.room_info.http_port;
+        let room = self.room_info.room.clone();
+        let user = net.username.clone();
+        let src = src.clone();
+        self.busy = true;
+        self.pending_upload = Some(file_id);
+        let tx = self.io_tx.clone();
+        std::thread::spawn(move || {
+            let r = net::upload_audio(&server, http_port, &room, &user, file_id, &src);
+            let _ = tx.send(IoEvent::UploadDone {
+                file_id,
+                ok: r.is_ok(),
+                msg: r.unwrap_or_default(),
+            });
+        });
+        self.status = format!("Uploading {} for a room member...", info.name);
+    }
+
+    /// Register the opened folder's files (metadata only) with the room.
+    fn register_folder(&mut self) {
+        let Some(net) = &self.net else { return };
+        let info = self.room_info.clone();
+        let user = net.username.clone();
+        let existing: std::collections::HashSet<String> =
+            self.room_files.iter().map(|f| f.name.clone()).collect();
+        let to_register: Vec<(String, u64)> = self
+            .files
+            .iter()
+            .filter(|f| {
+                let name = f
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                !existing.contains(&name)
+            })
+            .map(|f| {
+                let name = f
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+                (name, size)
+            })
+            .collect();
+        if to_register.is_empty() {
+            return;
+        }
+        self.busy = true;
+        let tx = self.io_tx.clone();
+        std::thread::spawn(move || {
+            match net::register_files(
+                &info.server,
+                info.http_port,
+                &info.room,
+                &user,
+                &to_register,
+            ) {
+                Ok(files) => {
+                    let _ = tx.send(IoEvent::FilesRegistered(files));
+                }
+                Err(e) => {
+                    let _ = tx.send(IoEvent::RoomFailed(e));
+                }
+            }
+        });
+    }
+
+    fn toggle_play(&mut self) {
+        let Some(file) = self.current_file().cloned() else {
+            if self.net.is_some() {
+                self.status = "Audio not available yet; downloading...".to_string();
+            } else {
+                self.status = "No files loaded. Open a folder first.".to_string();
+            }
+            return;
+        };
         if self.playing {
             self.player.pause();
             self.playing = false;
         } else {
-            let file = self.files[self.current_index].clone();
             match self.player.play(&file) {
                 Ok(()) => {
                     self.playing = true;
@@ -213,78 +456,148 @@ impl MinlabelApp {
         }
     }
 
-    fn connect(&mut self) {
-        self.show_connect = true;
+    fn show_room_window(&mut self) {
+        self.show_room = true;
     }
 
-    fn do_connect(&mut self) {
-        let info = self.connect_info.clone();
-        match NetClient::connect(&info) {
-            Ok(client) => {
-                self.net = Some(client);
-                self.status = format!(
-                    "Connecting to {}:{} as {}...",
-                    info.server, info.port, info.username
-                );
-                match net::fetch_file_list(&info.server, info.http_port) {
-                    Ok(files) => {
-                        self.remote_files = files.clone();
-                        self.file_ids.clear();
-                        for f in &files {
-                            self.file_ids.insert(f.name.clone(), f.id);
-                        }
-                        self.status = format!("Connected, {} files", files.len());
-                    }
-                    Err(e) => {
-                        self.status = format!("Connected but file list failed: {e}");
-                    }
+    fn do_create_room(&mut self) {
+        let mut info = self.room_info.clone();
+        if info.username.trim().is_empty() {
+            self.status = "Username is required".to_string();
+            return;
+        }
+        // Register the opened folder's files (metadata only) with the new room.
+        let folder_files: Vec<(String, u64)> = self
+            .files
+            .iter()
+            .map(|f| {
+                let name = f
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+                (name, size)
+            })
+            .collect();
+        self.busy = true;
+        let tx = self.io_tx.clone();
+        std::thread::spawn(move || {
+            let r = (|| -> Result<(String, Vec<FileInfo>, NetClient), String> {
+                let code = net::create_room(&info.server, info.http_port, &info.username)?;
+                info.room = code.clone();
+                let files = net::register_files(
+                    &info.server,
+                    info.http_port,
+                    &code,
+                    &info.username,
+                    &folder_files,
+                )?;
+                let client = NetClient::connect(&info)?;
+                Ok((code, files, client))
+            })();
+            match r {
+                Ok((code, files, client)) => {
+                    let _ = tx.send(IoEvent::RoomCreated {
+                        code,
+                        client,
+                        files,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(IoEvent::RoomFailed(e));
                 }
             }
-            Err(e) => {
-                self.status = format!("Connect failed: {e}");
-            }
+        });
+    }
+
+    fn do_join_room(&mut self) {
+        let info = self.room_info.clone();
+        if info.username.trim().is_empty() || info.room.trim().is_empty() {
+            self.status = "Username and room code are required".to_string();
+            return;
         }
+        self.busy = true;
+        let tx = self.io_tx.clone();
+        std::thread::spawn(move || {
+            let r = (|| -> Result<(Vec<FileInfo>, NetClient), String> {
+                let files = net::fetch_room_files(&info.server, info.http_port, &info.room)?;
+                let client = NetClient::connect(&info)?;
+                Ok((files, client))
+            })();
+            match r {
+                Ok((files, client)) => {
+                    let _ = tx.send(IoEvent::RoomJoined { client, files });
+                }
+                Err(e) => {
+                    let _ = tx.send(IoEvent::RoomFailed(e));
+                }
+            }
+        });
     }
 
     fn poll_net(&mut self) {
+        let events: Vec<NetEvent> = match &self.net {
+            Some(net) => net.events.lock().unwrap().try_iter().collect(),
+            None => Vec::new(),
+        };
         let mut disconnected = None;
-        {
-            let Some(net) = &self.net else { return };
-            let events = net.events.lock().unwrap();
-            while let Ok(evt) = events.try_recv() {
-                match evt {
-                    NetEvent::Connected => {
-                        self.status = "Connected".to_string();
+        for evt in events {
+            match evt {
+                NetEvent::Connected => {
+                    self.status = "Connected".to_string();
+                }
+                NetEvent::Disconnected(reason) => {
+                    disconnected = Some(reason);
+                }
+                NetEvent::Presence { user, file_id } => {
+                    self.locks.insert(file_id, user.clone());
+                    if self.current_file_id() == Some(file_id) {
+                        self.status = format!("{user} is annotating this file");
                     }
-                    NetEvent::Disconnected(reason) => {
-                        disconnected = Some(reason);
-                    }
-                    NetEvent::Presence { user, file_id } => {
-                        self.locks.insert(file_id, user.clone());
-                        if self.current_file_id() == Some(file_id) {
-                            self.status = format!("{user} is annotating this file");
+                }
+                NetEvent::Released { user: _, file_id } => {
+                    self.locks.remove(&file_id);
+                }
+                NetEvent::Annotated {
+                    user: _,
+                    file_id,
+                    data,
+                } => {
+                    if let Some(i) = self.room_files.iter().position(|f| f.id == file_id) {
+                        if i < self.labels.len() {
+                            self.labels[i] = data;
                         }
                     }
-                    NetEvent::Released { user: _, file_id } => {
-                        self.locks.remove(&file_id);
+                }
+                NetEvent::Progress { done, total } => {
+                    self.remote_progress = Some((done, total));
+                }
+                NetEvent::FileRequested { file_id } => {
+                    self.handle_file_requested(file_id);
+                }
+                NetEvent::FileUploaded { file_id } => {
+                    if let Some(f) = self.room_files.iter_mut().find(|f| f.id == file_id) {
+                        f.uploaded = true;
                     }
-                    NetEvent::Annotated { user: _, file_id, data } => {
-                        if let Some(i) = self.files.iter().position(|f| {
-                            self.file_ids
-                                .get(&f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default())
-                                == Some(&file_id)
-                        }) {
-                            if i < self.labels.len() {
-                                self.labels[i] = data;
-                            }
-                        }
+                    if self.current_file_id() == Some(file_id) {
+                        self.ensure_current_audio();
                     }
-                    NetEvent::Progress { done, total } => {
-                        self.remote_progress = Some((done, total));
+                }
+                NetEvent::FileReady { file_id } => {
+                    if let Some(f) = self.room_files.iter_mut().find(|f| f.id == file_id) {
+                        f.uploaded = true;
                     }
-                    NetEvent::Error(msg) => {
-                        self.status = format!("Net error: {msg}");
+                    if self.current_file_id() == Some(file_id) {
+                        self.ensure_current_audio();
                     }
+                }
+                NetEvent::FileUnavailable { file_id } => {
+                    if self.current_file_id() == Some(file_id) {
+                        self.status = format!("File {file_id} is unavailable (owner offline)");
+                    }
+                }
+                NetEvent::Error(msg) => {
+                    self.status = format!("Net error: {msg}");
                 }
             }
         }
@@ -292,19 +605,105 @@ impl MinlabelApp {
             self.status = format!("Disconnected: {reason}");
             self.net = None;
             self.locks.clear();
+            self.busy = false;
+            self.pending_download = None;
+            self.pending_upload = None;
+            self.current_audio = None;
+        }
+        self.poll_io();
+    }
+
+    fn poll_io(&mut self) {
+        let events: Vec<IoEvent> = self.io_events.lock().unwrap().try_iter().collect();
+        for evt in events {
+            match evt {
+                IoEvent::RoomCreated {
+                    code,
+                    client,
+                    files,
+                } => {
+                    self.room_info.room = code.clone();
+                    self.room_code = code;
+                    self.net = Some(client);
+                    self.room_files = files;
+                    self.labels = vec![LabelData::default(); self.room_files.len()];
+                    self.locks.clear();
+                    self.busy = false;
+                    self.remote_progress = None;
+                    self.status = format!(
+                        "Room {} created. Share the code with your team.",
+                        self.room_code
+                    );
+                }
+                IoEvent::RoomJoined { client, files } => {
+                    self.net = Some(client);
+                    self.room_files = files;
+                    self.labels = vec![LabelData::default(); self.room_files.len()];
+                    self.locks.clear();
+                    self.busy = false;
+                    self.remote_progress = None;
+                    self.status = format!(
+                        "Joined room {}. {} files.",
+                        self.room_info.room,
+                        self.room_files.len()
+                    );
+                }
+                IoEvent::RoomFailed(msg) => {
+                    self.busy = false;
+                    self.status = format!("Room failed: {msg}");
+                }
+                IoEvent::FilesRegistered(files) => {
+                    self.busy = false;
+                    let added = files.len();
+                    self.room_files.extend(files);
+                    self.labels
+                        .resize(self.room_files.len(), LabelData::default());
+                    self.status = format!("Registered {added} files with the room");
+                }
+                IoEvent::DownloadDone { file_id, path } => {
+                    self.busy = false;
+                    self.pending_download = None;
+                    if let Some(f) = self.room_files.iter_mut().find(|f| f.id == file_id) {
+                        f.uploaded = true;
+                    }
+                    if self.current_file_id() == Some(file_id) {
+                        self.current_audio = Some(path);
+                        if let Some(f) = self.room_files.get(self.current_index) {
+                            self.status = format!("Downloaded {}", f.name);
+                        }
+                    }
+                }
+                IoEvent::DownloadFailed { file_id: _, msg } => {
+                    self.busy = false;
+                    self.pending_download = None;
+                    self.status = format!("Download failed: {msg}");
+                }
+                IoEvent::UploadDone { file_id, ok, msg } => {
+                    self.busy = false;
+                    self.pending_upload = None;
+                    if ok {
+                        if let Some(f) = self.room_files.iter_mut().find(|f| f.id == file_id) {
+                            f.uploaded = true;
+                        }
+                        self.status = format!("Uploaded file {file_id}");
+                    } else {
+                        self.status = format!("Upload failed: {msg}");
+                    }
+                }
+            }
         }
     }
 
     fn current_file_id(&self) -> Option<u32> {
-        let name = self
-            .current_file()?
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())?;
-        self.file_ids.get(&name).copied()
+        if self.net.is_some() {
+            self.room_files.get(self.current_index).map(|f| f.id)
+        } else {
+            None
+        }
     }
 
     fn current_file(&self) -> Option<&PathBuf> {
-        self.files.get(self.current_index)
+        self.current_audio.as_ref()
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
@@ -342,8 +741,8 @@ impl eframe::App for MinlabelApp {
                         self.export();
                         ui.close();
                     }
-                    if ui.button("Connect").clicked() {
-                        self.connect();
+                    if ui.button("Room").clicked() {
+                        self.show_room_window();
                         ui.close();
                     }
                     ui.separator();
@@ -380,87 +779,12 @@ impl eframe::App for MinlabelApp {
             .resizable(false)
             .exact_size(self.left_width)
             .show(ui, |ui| {
-                if self.files.is_empty() {
+                if self.net.is_some() {
+                    self.room_file_list_ui(ui);
+                } else if self.files.is_empty() {
                     ui.label("No folder opened.");
                 } else {
-                    let row_height = ui.text_style_height(&egui::TextStyle::Body);
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        let name_col = (self.left_width - self.size_col_width - 8.0).max(40.0);
-                        ui.horizontal(|ui| {
-                            ui.add_sized(
-                                [name_col, row_height],
-                                egui::Label::new(egui::RichText::new("Name").strong()).truncate(),
-                            );
-                            let (sep_rect, _) = ui.allocate_exact_size(
-                                egui::vec2(8.0, row_height),
-                                egui::Sense::hover(),
-                            );
-                            let sep_response = ui.interact(
-                                sep_rect,
-                                egui::Id::new("col_separator"),
-                                egui::Sense::drag(),
-                            );
-                            if sep_response.dragged() {
-                                self.size_col_width = (self.size_col_width
-                                    + sep_response.drag_delta().x)
-                                    .clamp(40.0, 200.0);
-                            }
-                            if sep_response.hovered() || sep_response.dragged() {
-                                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                            }
-                            ui.add_sized(
-                                [self.size_col_width, row_height],
-                                egui::Label::new(egui::RichText::new("Size").strong()).truncate(),
-                            );
-                        });
-                        let files = self.files.clone();
-                        let labels = self.labels.clone();
-                        let locks = self.locks.clone();
-                        let file_ids = self.file_ids.clone();
-                        for (i, file) in files.iter().enumerate() {
-                            let selected = i == self.current_index;
-                            let checked = labels.get(i).map(|l| l.is_check).unwrap_or(false);
-                            let name = file
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_else(|| file.display().to_string());
-                            let size = file.metadata().map(|m| m.len()).unwrap_or(0);
-                            let name_col =
-                                (self.left_width - self.size_col_width - 8.0).max(40.0);
-                            let fid = file_ids.get(&name).copied();
-                            let locked_by = fid.and_then(|id| locks.get(&id).cloned());
-                            ui.horizontal(|ui| {
-                                if locked_by.is_some() {
-                                    ui.colored_label(egui::Color32::YELLOW, "\u{25CF}");
-                                }
-                                let text = if checked {
-                                    egui::RichText::new(&name).weak()
-                                } else {
-                                    egui::RichText::new(&name)
-                                };
-                                let resp = ui.add_sized(
-                                    [name_col - if locked_by.is_some() { 14.0 } else { 0.0 }, row_height],
-                                    egui::Button::selectable(selected, text).truncate(),
-                                );
-                                if resp.clicked() {
-                                    self.save_current_label();
-                                    self.current_index = i;
-                                    self.playing = false;
-                                    self.player.stop();
-                                    self.load_current_label();
-                                }
-                                let size_text = if checked {
-                                    egui::RichText::new(format_size(size)).weak()
-                                } else {
-                                    egui::RichText::new(format_size(size))
-                                };
-                                ui.add_sized(
-                                    [self.size_col_width, row_height],
-                                    egui::Label::new(size_text).truncate(),
-                                );
-                            });
-                        }
-                    });
+                    self.local_file_list_ui(ui);
                 }
             });
 
@@ -511,41 +835,204 @@ impl eframe::App for MinlabelApp {
                 });
         }
 
-        if self.show_connect {
+        if self.show_room {
             let mut open = true;
-            egui::Window::new("Connect")
+            egui::Window::new("Room")
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
                 .show(ui.ctx(), |ui| {
                     ui.label("Server address:");
-                    ui.text_edit_singleline(&mut self.connect_info.server);
-                    ui.label("Port (room):");
-                    ui.add(
-                        egui::DragValue::new(&mut self.connect_info.port)
-                            .range(1..=65535),
-                    );
+                    ui.text_edit_singleline(&mut self.room_info.server);
+                    ui.label("Port:");
+                    ui.add(egui::DragValue::new(&mut self.room_info.port).range(1..=65535));
                     ui.label("HTTP port:");
-                    ui.add(
-                        egui::DragValue::new(&mut self.connect_info.http_port)
-                            .range(1..=65535),
-                    );
+                    ui.add(egui::DragValue::new(&mut self.room_info.http_port).range(1..=65535));
                     ui.label("Username:");
-                    ui.text_edit_singleline(&mut self.connect_info.username);
+                    ui.text_edit_singleline(&mut self.room_info.username);
+                    ui.separator();
+                    ui.label("Room code:");
+                    ui.text_edit_singleline(&mut self.room_info.room);
                     ui.add_space(8.0);
-                    if ui.button("Connect").clicked() {
-                        self.do_connect();
-                        self.show_connect = false;
-                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Create room").clicked() {
+                            self.do_create_room();
+                            self.show_room = false;
+                        }
+                        if ui.button("Join room").clicked() {
+                            self.do_join_room();
+                            self.show_room = false;
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Creating a room registers your opened folder's files \
+                             (metadata only); audio is uploaded on demand.",
+                        )
+                        .weak()
+                        .small(),
+                    );
                 });
             if !open {
-                self.show_connect = false;
+                self.show_room = false;
             }
         }
     }
 }
 
 impl MinlabelApp {
+    fn room_file_list_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!("Room {}", self.room_code)).strong());
+            if ui.button("Leave").clicked() {
+                self.net = None;
+                self.locks.clear();
+                self.room_files.clear();
+                self.remote_progress = None;
+                self.current_audio = None;
+                self.busy = false;
+                self.pending_download = None;
+                self.pending_upload = None;
+            }
+        });
+        if self.room_files.is_empty() {
+            ui.label("No files in this room yet.");
+            return;
+        }
+        let row_height = ui.text_style_height(&egui::TextStyle::Body);
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            let name_col = (self.left_width - self.size_col_width - 8.0).max(40.0);
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [name_col, row_height],
+                    egui::Label::new(egui::RichText::new("Name").strong()).truncate(),
+                );
+                let (sep_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(8.0, row_height), egui::Sense::hover());
+                let sep_response = ui.interact(
+                    sep_rect,
+                    egui::Id::new("col_separator"),
+                    egui::Sense::drag(),
+                );
+                if sep_response.dragged() {
+                    self.size_col_width =
+                        (self.size_col_width + sep_response.drag_delta().x).clamp(40.0, 200.0);
+                }
+                if sep_response.hovered() || sep_response.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
+                ui.add_sized(
+                    [self.size_col_width, row_height],
+                    egui::Label::new(egui::RichText::new("Size").strong()).truncate(),
+                );
+            });
+            let room_files = self.room_files.clone();
+            let locks = self.locks.clone();
+            let current = self.current_index;
+            for (i, info) in room_files.iter().enumerate() {
+                let selected = i == current;
+                let locked_by = locks.get(&info.id).cloned();
+                let name_col = (self.left_width - self.size_col_width - 8.0).max(40.0);
+                ui.horizontal(|ui| {
+                    if locked_by.is_some() {
+                        ui.colored_label(egui::Color32::YELLOW, "\u{25CF}");
+                    }
+                    let text = if info.uploaded {
+                        egui::RichText::new(&info.name).weak()
+                    } else {
+                        egui::RichText::new(&info.name)
+                    };
+                    let resp = ui.add_sized(
+                        [
+                            name_col - if locked_by.is_some() { 14.0 } else { 0.0 },
+                            row_height,
+                        ],
+                        egui::Button::selectable(selected, text).truncate(),
+                    );
+                    if resp.clicked() {
+                        self.select_file(i);
+                    }
+                    let size_text = if info.uploaded {
+                        egui::RichText::new(format_size(info.size)).weak()
+                    } else {
+                        egui::RichText::new(format_size(info.size))
+                    };
+                    ui.add_sized(
+                        [self.size_col_width, row_height],
+                        egui::Label::new(size_text).truncate(),
+                    );
+                });
+            }
+        });
+    }
+
+    fn local_file_list_ui(&mut self, ui: &mut egui::Ui) {
+        let row_height = ui.text_style_height(&egui::TextStyle::Body);
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            let name_col = (self.left_width - self.size_col_width - 8.0).max(40.0);
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [name_col, row_height],
+                    egui::Label::new(egui::RichText::new("Name").strong()).truncate(),
+                );
+                let (sep_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(8.0, row_height), egui::Sense::hover());
+                let sep_response = ui.interact(
+                    sep_rect,
+                    egui::Id::new("col_separator"),
+                    egui::Sense::drag(),
+                );
+                if sep_response.dragged() {
+                    self.size_col_width =
+                        (self.size_col_width + sep_response.drag_delta().x).clamp(40.0, 200.0);
+                }
+                if sep_response.hovered() || sep_response.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
+                ui.add_sized(
+                    [self.size_col_width, row_height],
+                    egui::Label::new(egui::RichText::new("Size").strong()).truncate(),
+                );
+            });
+            let files = self.files.clone();
+            let labels = self.labels.clone();
+            for (i, file) in files.iter().enumerate() {
+                let selected = i == self.current_index;
+                let checked = labels.get(i).map(|l| l.is_check).unwrap_or(false);
+                let name = file
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| file.display().to_string());
+                let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+                let name_col = (self.left_width - self.size_col_width - 8.0).max(40.0);
+                ui.horizontal(|ui| {
+                    let text = if checked {
+                        egui::RichText::new(&name).weak()
+                    } else {
+                        egui::RichText::new(&name)
+                    };
+                    let resp = ui.add_sized(
+                        [name_col, row_height],
+                        egui::Button::selectable(selected, text).truncate(),
+                    );
+                    if resp.clicked() {
+                        self.select_file(i);
+                    }
+                    let size_text = if checked {
+                        egui::RichText::new(format_size(size)).weak()
+                    } else {
+                        egui::RichText::new(format_size(size))
+                    };
+                    ui.add_sized(
+                        [self.size_col_width, row_height],
+                        egui::Label::new(size_text).truncate(),
+                    );
+                });
+            }
+        });
+    }
+
     fn apply_text(&mut self, append: bool) {
         let text = self.paste_text.trim().to_string();
         if text.is_empty() {
@@ -559,6 +1046,14 @@ impl MinlabelApp {
         self.annotation_text = transcribed;
         self.status = format!("Transcribed ({})", self.mode.to_string());
         self.save_current_label();
+        if let Some(net) = &self.net {
+            if let Some(id) = self.current_file_id() {
+                if let Some(data) = self.labels.get(self.current_index).cloned() {
+                    net.annotate(id, &data);
+                    self.locks.remove(&id);
+                }
+            }
+        }
     }
 
     fn player_ui(&mut self, ui: &mut egui::Ui) {
@@ -571,14 +1066,22 @@ impl MinlabelApp {
                 {
                     ui.colored_label(egui::Color32::RED, format!("{user} 正在标注"));
                 }
-                ui.label(
-                    egui::RichText::new(file.display().to_string())
-                        .strong()
-                        .size(16.0),
-                );
+                let display = if self.net.is_some() {
+                    self.room_files
+                        .get(self.current_index)
+                        .map(|f| f.name.clone())
+                        .unwrap_or_default()
+                } else {
+                    file.display().to_string()
+                };
+                ui.label(egui::RichText::new(display).strong().size(16.0));
             }
             None => {
-                ui.label("No file selected. Open a folder first.");
+                if self.net.is_some() {
+                    ui.label("Select a file in the room list.");
+                } else {
+                    ui.label("No file selected. Open a folder first.");
+                }
                 return;
             }
         }
@@ -709,7 +1212,10 @@ impl MinlabelApp {
             .auto_shrink(false)
             .show(ui, |ui| {
                 ui.add_sized(
-                    [ui.available_width(), (ui.available_height() - 30.0).max(60.0)],
+                    [
+                        ui.available_width(),
+                        (ui.available_height() - 30.0).max(60.0),
+                    ],
                     egui::TextEdit::multiline(&mut self.annotation_text)
                         .hint_text("Annotation text"),
                 );
@@ -796,10 +1302,9 @@ impl Player {
             let file_sample_rate = spec.sample_rate;
             let channels = spec.channels;
             let samples: Vec<f32> = match spec.sample_format {
-                hound::SampleFormat::Float => reader
-                    .samples::<f32>()
-                    .map(|s| s.unwrap_or(0.0))
-                    .collect(),
+                hound::SampleFormat::Float => {
+                    reader.samples::<f32>().map(|s| s.unwrap_or(0.0)).collect()
+                }
                 hound::SampleFormat::Int => {
                     let bits = spec.bits_per_sample;
                     let max = (1i64 << (bits - 1)) as f32;
@@ -818,9 +1323,7 @@ impl Player {
                 .default_output_device()
                 .ok_or_else(|| "No output device".to_string())?;
             self.device = Some(device.to_string());
-            let config = device
-                .default_output_config()
-                .map_err(|e| e.to_string())?;
+            let config = device.default_output_config().map_err(|e| e.to_string())?;
             let device_sample_rate = config.sample_rate();
             let device_channels = config.channels() as usize;
 
@@ -850,9 +1353,7 @@ impl Player {
             .default_output_device()
             .ok_or_else(|| "No output device".to_string())?;
         self.device = Some(device.to_string());
-        let config = device
-            .default_output_config()
-            .map_err(|e| e.to_string())?;
+        let config = device.default_output_config().map_err(|e| e.to_string())?;
         let stream = device
             .build_output_stream(
                 config.into(),

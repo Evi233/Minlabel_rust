@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::path::PathBuf;
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -13,6 +14,7 @@ pub struct ConnectInfo {
     pub port: u16,
     pub http_port: u16,
     pub username: String,
+    pub room: String,
 }
 
 impl Default for ConnectInfo {
@@ -22,6 +24,7 @@ impl Default for ConnectInfo {
             port: 9000,
             http_port: 8080,
             username: String::new(),
+            room: String::new(),
         }
     }
 }
@@ -30,7 +33,15 @@ impl Default for ConnectInfo {
 pub struct FileInfo {
     pub id: u32,
     pub name: String,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub uploaded: bool,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
     pub status: String,
+    #[serde(default)]
     pub annotated_by: Option<String>,
 }
 
@@ -49,42 +60,128 @@ pub struct LabelData {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
-    Claim { file_id: u32 },
-    Release { file_id: u32 },
+    Claim {
+        file_id: u32,
+    },
+    Release {
+        file_id: u32,
+    },
     Annotate {
         file_id: u32,
         data: LabelData,
+    },
+    /// Ask the room to make this file's audio available; the owning client
+    /// will be asked to upload it on demand.
+    RequestFile {
+        file_id: u32,
     },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
-    Presence { user: String, file_id: u32 },
-    Release { user: String, file_id: u32 },
+    Presence {
+        user: String,
+        file_id: u32,
+    },
+    Release {
+        user: String,
+        file_id: u32,
+    },
     Annotated {
         user: String,
         file_id: u32,
         data: LabelData,
     },
-    Progress { done: u32, total: u32 },
+    Progress {
+        done: u32,
+        total: u32,
+    },
+    /// Another member asked for a file this client owns: upload it now.
+    FileRequested {
+        file_id: u32,
+    },
+    /// A file's bytes have been uploaded to the server.
+    FileUploaded {
+        file_id: u32,
+    },
+    /// The requested file is already on the server: download it.
+    FileReady {
+        file_id: u32,
+    },
+    /// The file's owner is not connected, so it cannot be served right now.
+    FileUnavailable {
+        file_id: u32,
+    },
 }
 
 #[derive(Clone, Debug)]
 pub enum NetEvent {
     Connected,
     Disconnected(String),
-    Presence { user: String, file_id: u32 },
-    Released { user: String, file_id: u32 },
+    Presence {
+        user: String,
+        file_id: u32,
+    },
+    Released {
+        user: String,
+        file_id: u32,
+    },
     Annotated {
         user: String,
         file_id: u32,
         data: LabelData,
     },
-    Progress { done: u32, total: u32 },
+    Progress {
+        done: u32,
+        total: u32,
+    },
+    FileRequested {
+        file_id: u32,
+    },
+    FileUploaded {
+        file_id: u32,
+    },
+    FileReady {
+        file_id: u32,
+    },
+    FileUnavailable {
+        file_id: u32,
+    },
     Error(String),
 }
 
+/// Results of background upload/download work, consumed on the UI thread.
+#[derive(Debug)]
+pub enum IoEvent {
+    RoomCreated {
+        code: String,
+        client: NetClient,
+        files: Vec<FileInfo>,
+    },
+    RoomJoined {
+        client: NetClient,
+        files: Vec<FileInfo>,
+    },
+    RoomFailed(String),
+    /// Metadata of newly registered files (no audio bytes uploaded yet).
+    FilesRegistered(Vec<FileInfo>),
+    DownloadDone {
+        file_id: u32,
+        path: PathBuf,
+    },
+    DownloadFailed {
+        file_id: u32,
+        msg: String,
+    },
+    UploadDone {
+        file_id: u32,
+        ok: bool,
+        msg: String,
+    },
+}
+
+#[derive(Debug)]
 pub struct NetClient {
     tx: mpsc::Sender<ClientMsg>,
     pub events: Arc<Mutex<Receiver<NetEvent>>>,
@@ -100,10 +197,11 @@ impl NetClient {
         let connected_clone = Arc::clone(&connected);
 
         let url = format!(
-            "ws://{}:{}/ws?user={}",
+            "ws://{}:{}/ws?user={}&room={}",
             info.server,
             info.port,
-            urlencode(&info.username)
+            urlencode(&info.username),
+            urlencode(&info.room)
         );
         let username = info.username.clone();
 
@@ -147,6 +245,10 @@ impl NetClient {
                                             ServerMsg::Release { user, file_id } => NetEvent::Released { user, file_id },
                                             ServerMsg::Annotated { user, file_id, data } => NetEvent::Annotated { user, file_id, data },
                                             ServerMsg::Progress { done, total } => NetEvent::Progress { done, total },
+                                            ServerMsg::FileRequested { file_id } => NetEvent::FileRequested { file_id },
+                                            ServerMsg::FileUploaded { file_id } => NetEvent::FileUploaded { file_id },
+                                            ServerMsg::FileReady { file_id } => NetEvent::FileReady { file_id },
+                                            ServerMsg::FileUnavailable { file_id } => NetEvent::FileUnavailable { file_id },
                                         };
                                         let _ = evt_tx.send(evt);
                                     }
@@ -195,16 +297,108 @@ impl NetClient {
         });
     }
 
+    pub fn request_file(&self, file_id: u32) {
+        self.send(ClientMsg::RequestFile { file_id });
+    }
+
     pub fn is_connected(&self) -> bool {
         *self.connected.lock().unwrap()
     }
 }
 
-pub fn fetch_file_list(server: &str, http_port: u16) -> Result<Vec<FileInfo>, String> {
-    let url = format!("http://{server}:{http_port}/api/files");
+// ---------------------------------------------------------------------------
+// Blocking HTTP helpers (run on background threads)
+
+/// Create a room; returns the 6-character room code.
+pub fn create_room(server: &str, http_port: u16, user: &str) -> Result<String, String> {
+    let url = format!("http://{server}:{http_port}/api/rooms");
+    let resp = reqwest::blocking::Client::new()
+        .post(&url)
+        .json(&serde_json::json!({ "user": user }))
+        .send()
+        .map_err(|e| e.to_string())?;
+    let v: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+    v["id"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "no room id".to_string())
+}
+
+/// Register file metadata (name/size) without uploading the audio bytes.
+/// Returns the registered files with their server ids.
+pub fn register_files(
+    server: &str,
+    http_port: u16,
+    room: &str,
+    user: &str,
+    files: &[(String, u64)],
+) -> Result<Vec<FileInfo>, String> {
+    let url = format!("http://{server}:{http_port}/api/rooms/{room}/files");
+    let list: Vec<serde_json::Value> = files
+        .iter()
+        .map(|(name, size)| serde_json::json!({ "name": name, "size": size }))
+        .collect();
+    let resp = reqwest::blocking::Client::new()
+        .post(&url)
+        .json(&serde_json::json!({ "user": user, "files": list }))
+        .send()
+        .map_err(|e| e.to_string())?;
+    let v: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+    v["files"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|f| serde_json::from_value(f).map_err(|e| e.to_string()))
+        .collect()
+}
+
+pub fn fetch_room_files(server: &str, http_port: u16, room: &str) -> Result<Vec<FileInfo>, String> {
+    let url = format!("http://{server}:{http_port}/api/rooms/{room}/files");
     let resp = reqwest::blocking::get(&url).map_err(|e| e.to_string())?;
-    let list: Vec<FileInfo> = resp.json().map_err(|e| e.to_string())?;
-    Ok(list)
+    if !resp.status().is_success() {
+        return Err(format!("list files failed: {}", resp.status()));
+    }
+    let v: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+    let files: Vec<FileInfo> =
+        serde_json::from_value(v.get("files").cloned().unwrap_or(serde_json::json!([])))
+            .map_err(|e| e.to_string())?;
+    Ok(files)
+}
+
+/// Upload a file's audio bytes to the server (called when another room
+/// member requested the file).
+pub fn upload_audio(
+    server: &str,
+    http_port: u16,
+    room: &str,
+    user: &str,
+    file_id: u32,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    let url = format!("http://{server}:{http_port}/api/rooms/{room}/files/{file_id}/audio");
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "audio.bin".to_string());
+    let form = reqwest::blocking::multipart::Form::new()
+        .text("user", user.to_string())
+        .part(
+            "file",
+            reqwest::blocking::multipart::Part::file(path)
+                .map_err(|e| e.to_string())?
+                .file_name(name),
+        );
+    let resp = reqwest::blocking::Client::new()
+        .post(&url)
+        .multipart(form)
+        .send()
+        .map_err(|e| e.to_string())?;
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("upload failed: {}", resp.status()))
+    }
 }
 
 pub fn fetch_annotation(
@@ -229,6 +423,9 @@ pub fn fetch_audio(
 ) -> Result<(), String> {
     let url = format!("http://{server}:{http_port}/api/files/{file_id}/audio");
     let resp = reqwest::blocking::get(&url).map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("download failed: {}", resp.status()));
+    }
     let bytes = resp.bytes().map_err(|e| e.to_string())?;
     std::fs::write(dest, bytes).map_err(|e| e.to_string())
 }

@@ -14,7 +14,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+reqwest = { version = "0.12", features = ["blocking", "json", "multipart"] }
 
 [profile.release]
 strip = true
