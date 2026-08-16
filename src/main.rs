@@ -361,16 +361,11 @@ impl MinlabelApp {
             );
             return;
         };
-        if self.busy || self.pending_upload.is_some() {
-            self.status = format!("Busy; will upload {} later", info.name);
-            return;
-        }
         let server = self.room_info.server.clone();
         let http_port = self.room_info.http_port;
         let room = self.room_info.room.clone();
         let user = net.username.clone();
         let src = src.clone();
-        self.busy = true;
         self.pending_upload = Some(file_id);
         let tx = self.io_tx.clone();
         std::thread::spawn(move || {
@@ -564,19 +559,10 @@ impl MinlabelApp {
                     disconnected = Some(reason);
                 }
                 NetEvent::Presence { user, file_id } => {
-                    self.locks.insert(file_id, user.clone());
-                    if self.current_file_id() == Some(file_id) {
-                        // Our own claim echoes back; don't clobber the
-                        // "Requesting ..." status with it.
-                        let mine = self
-                            .net
-                            .as_ref()
-                            .map(|n| n.username == user)
-                            .unwrap_or(false);
-                        if !mine {
-                            self.status = format!("{user} is annotating this file");
-                        }
-                    }
+                    // Presence is shown by the lock dot in the file list and
+                    // the red label in the player area; it must not clobber
+                    // the "Requesting ..." / download status in the status bar.
+                    self.locks.insert(file_id, user);
                 }
                 NetEvent::Released { file_id } => {
                     self.locks.remove(&file_id);
