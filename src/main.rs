@@ -83,7 +83,6 @@ struct MinlabelApp {
 
 struct Transfer {
     kind: &'static str,
-    file_id: u32,
     progress: f32,
 }
 
@@ -332,7 +331,6 @@ impl MinlabelApp {
                 self.pending_upload = Some(info.id);
                 self.transfer = Some(Transfer {
                     kind: "upload",
-                    file_id: info.id,
                     progress: 0.0,
                 });
                 let src = src.clone();
@@ -374,7 +372,6 @@ impl MinlabelApp {
         self.pending_download = Some(info.id);
         self.transfer = Some(Transfer {
             kind: "download",
-            file_id: info.id,
             progress: 0.0,
         });
         self.download_done.store(0, Ordering::Relaxed);
@@ -463,7 +460,6 @@ impl MinlabelApp {
         self.pending_upload = Some(file_id);
         self.transfer = Some(Transfer {
             kind: "upload",
-            file_id,
             progress: 0.0,
         });
         let tx = self.io_tx.clone();
