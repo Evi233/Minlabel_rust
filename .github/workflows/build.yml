@@ -25,14 +25,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-cursor-dev libxkbcommon-dev libssl-dev libgtk-3-dev libasound2-dev
-
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
 
       - name: Build
         run: cargo build --release

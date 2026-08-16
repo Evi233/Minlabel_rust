@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
@@ -124,11 +123,9 @@ pub enum NetEvent {
         file_id: u32,
     },
     Released {
-        user: String,
         file_id: u32,
     },
     Annotated {
-        user: String,
         file_id: u32,
         data: LabelData,
     },
@@ -185,7 +182,6 @@ pub enum IoEvent {
 pub struct NetClient {
     tx: mpsc::Sender<ClientMsg>,
     pub events: Arc<Mutex<Receiver<NetEvent>>>,
-    pub connected: Arc<Mutex<bool>>,
     pub username: String,
 }
 
@@ -193,8 +189,6 @@ impl NetClient {
     pub fn connect(info: &ConnectInfo) -> Result<Self, String> {
         let (msg_tx, mut msg_rx) = mpsc::channel::<ClientMsg>(64);
         let (evt_tx, evt_rx) = channel::<NetEvent>();
-        let connected = Arc::new(Mutex::new(false));
-        let connected_clone = Arc::clone(&connected);
 
         let url = format!(
             "ws://{}:{}/ws?user={}&room={}",
@@ -224,7 +218,6 @@ impl NetClient {
                         return;
                     }
                 };
-                *connected_clone.lock().unwrap() = true;
                 let _ = evt_tx.send(NetEvent::Connected);
 
                 loop {
@@ -242,8 +235,8 @@ impl NetClient {
                                     if let Ok(msg) = serde_json::from_str::<ServerMsg>(&text) {
                                         let evt = match msg {
                                             ServerMsg::Presence { user, file_id } => NetEvent::Presence { user, file_id },
-                                            ServerMsg::Release { user, file_id } => NetEvent::Released { user, file_id },
-                                            ServerMsg::Annotated { user, file_id, data } => NetEvent::Annotated { user, file_id, data },
+                                            ServerMsg::Release { user: _, file_id } => NetEvent::Released { file_id },
+                                            ServerMsg::Annotated { user: _, file_id, data } => NetEvent::Annotated { file_id, data },
                                             ServerMsg::Progress { done, total } => NetEvent::Progress { done, total },
                                             ServerMsg::FileRequested { file_id } => NetEvent::FileRequested { file_id },
                                             ServerMsg::FileUploaded { file_id } => NetEvent::FileUploaded { file_id },
@@ -266,14 +259,12 @@ impl NetClient {
                         }
                     }
                 }
-                *connected_clone.lock().unwrap() = false;
             });
         });
 
         Ok(Self {
             tx: msg_tx,
             events: Arc::new(Mutex::new(evt_rx)),
-            connected,
             username,
         })
     }
@@ -299,10 +290,6 @@ impl NetClient {
 
     pub fn request_file(&self, file_id: u32) {
         self.send(ClientMsg::RequestFile { file_id });
-    }
-
-    pub fn is_connected(&self) -> bool {
-        *self.connected.lock().unwrap()
     }
 }
 
@@ -401,20 +388,6 @@ pub fn upload_audio(
     }
 }
 
-pub fn fetch_annotation(
-    server: &str,
-    http_port: u16,
-    file_id: u32,
-) -> Result<Option<LabelData>, String> {
-    let url = format!("http://{server}:{http_port}/api/annotations/{file_id}");
-    let resp = reqwest::blocking::get(&url).map_err(|e| e.to_string())?;
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-    let label: LabelData = resp.json().map_err(|e| e.to_string())?;
-    Ok(Some(label))
-}
-
 pub fn fetch_audio(
     server: &str,
     http_port: u16,
@@ -442,5 +415,3 @@ fn urlencode(s: &str) -> String {
     }
     out
 }
-
-pub type LockMap = HashMap<u32, String>;

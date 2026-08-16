@@ -555,14 +555,10 @@ impl MinlabelApp {
                         self.status = format!("{user} is annotating this file");
                     }
                 }
-                NetEvent::Released { user: _, file_id } => {
+                NetEvent::Released { file_id } => {
                     self.locks.remove(&file_id);
                 }
-                NetEvent::Annotated {
-                    user: _,
-                    file_id,
-                    data,
-                } => {
+                NetEvent::Annotated { file_id, data } => {
                     if let Some(i) = self.room_files.iter().position(|f| f.id == file_id) {
                         if i < self.labels.len() {
                             self.labels[i] = data;
@@ -673,10 +669,10 @@ impl MinlabelApp {
                         }
                     }
                 }
-                IoEvent::DownloadFailed { file_id: _, msg } => {
+                IoEvent::DownloadFailed { file_id, msg } => {
                     self.busy = false;
                     self.pending_download = None;
-                    self.status = format!("Download failed: {msg}");
+                    self.status = format!("Download failed for file {file_id}: {msg}");
                 }
                 IoEvent::UploadDone { file_id, ok, msg } => {
                     self.busy = false;
@@ -1044,7 +1040,7 @@ impl MinlabelApp {
             self.annotation_text.push('\n');
         }
         self.annotation_text = transcribed;
-        self.status = format!("Transcribed ({})", self.mode.to_string());
+        self.status = format!("Transcribed ({})", self.mode.as_str());
         self.save_current_label();
         if let Some(net) = &self.net {
             if let Some(id) = self.current_file_id() {
@@ -1197,11 +1193,11 @@ impl MinlabelApp {
                 self.apply_text(true);
             }
             egui::ComboBox::from_id_salt("mode_combo")
-                .selected_text(self.mode.to_string())
+                .selected_text(self.mode.as_str())
                 .width(btn_w)
                 .show_ui(ui, |ui| {
                     for m in [Mode::Pinyin, Mode::Romaji, Mode::Cantonese] {
-                        ui.selectable_value(&mut self.mode, m, m.to_string());
+                        ui.selectable_value(&mut self.mode, m, m.as_str());
                     }
                 });
         });

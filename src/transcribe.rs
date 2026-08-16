@@ -9,7 +9,7 @@ pub enum Mode {
 }
 
 impl Mode {
-    pub fn to_string(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Mode::Pinyin => "pinyin",
             Mode::Romaji => "romaji",
