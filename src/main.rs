@@ -462,7 +462,8 @@ impl MinlabelApp {
 
     fn do_create_room(&mut self) {
         let mut info = self.room_info.clone();
-        if info.username.trim().is_empty() {
+        info.username = info.username.trim().to_string();
+        if info.username.is_empty() {
             self.status = "Username is required".to_string();
             return;
         }
@@ -511,8 +512,10 @@ impl MinlabelApp {
     }
 
     fn do_join_room(&mut self) {
-        let info = self.room_info.clone();
-        if info.username.trim().is_empty() || info.room.trim().is_empty() {
+        let mut info = self.room_info.clone();
+        info.username = info.username.trim().to_string();
+        info.room = info.room.trim().to_string();
+        if info.username.is_empty() || info.room.is_empty() {
             self.status = "Username and room code are required".to_string();
             return;
         }

@@ -20,7 +20,9 @@ impl Default for ConnectInfo {
     fn default() -> Self {
         Self {
             server: "127.0.0.1".to_string(),
-            port: 9000,
+            // The server serves HTTP and WebSocket on the same port
+            // (MINLABEL_ADDR, default 8080), so both default to it.
+            port: 8080,
             http_port: 8080,
             username: String::new(),
             room: String::new(),
@@ -118,33 +120,14 @@ pub enum ServerMsg {
 pub enum NetEvent {
     Connected,
     Disconnected(String),
-    Presence {
-        user: String,
-        file_id: u32,
-    },
-    Released {
-        file_id: u32,
-    },
-    Annotated {
-        file_id: u32,
-        data: LabelData,
-    },
-    Progress {
-        done: u32,
-        total: u32,
-    },
-    FileRequested {
-        file_id: u32,
-    },
-    FileUploaded {
-        file_id: u32,
-    },
-    FileReady {
-        file_id: u32,
-    },
-    FileUnavailable {
-        file_id: u32,
-    },
+    Presence { user: String, file_id: u32 },
+    Released { file_id: u32 },
+    Annotated { file_id: u32, data: LabelData },
+    Progress { done: u32, total: u32 },
+    FileRequested { file_id: u32 },
+    FileUploaded { file_id: u32 },
+    FileReady { file_id: u32 },
+    FileUnavailable { file_id: u32 },
     Error(String),
 }
 
