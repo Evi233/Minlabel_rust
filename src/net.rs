@@ -398,22 +398,42 @@ pub fn upload_audio(
     }
 }
 
+/// Download a file's audio. `done` / `total` are updated as bytes arrive so
+/// the UI can show real progress (total is 0 until the response header is in).
 pub fn fetch_audio(
     server: &str,
     http_port: u16,
     file_id: u32,
     dest: &std::path::Path,
+    done: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    total: &std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<(), String> {
+    use std::io::{Read, Write};
     let url = format!("http://{server}:{http_port}/api/files/{file_id}/audio");
-    let resp = http_client().get(&url).send().map_err(|e| e.to_string())?;
+    let mut resp = http_client().get(&url).send().map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("download failed: {}", resp.status()));
     }
-    let bytes = resp.bytes().map_err(|e| e.to_string())?;
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    std::fs::write(dest, bytes).map_err(|e| e.to_string())
+    total.store(
+        resp.content_length().unwrap_or(0),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let mut file = std::fs::File::create(dest).map_err(|e| e.to_string())?;
+    let mut buf = [0u8; 64 * 1024];
+    let mut downloaded: u64 = 0;
+    loop {
+        let n = resp.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        downloaded += n as u64;
+        done.store(downloaded, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
 }
 
 /// Download a .lab / .json sidecar next to the audio. Returns Ok(false) when

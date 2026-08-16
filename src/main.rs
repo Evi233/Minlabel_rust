@@ -74,6 +74,17 @@ struct MinlabelApp {
     pending_download: Option<u32>,
     pending_upload: Option<u32>,
     cache_dir: PathBuf,
+    /// In-flight upload/download shown in the player progress area.
+    /// kind: "upload" (fake progress) or "download" (real byte progress).
+    transfer: Option<Transfer>,
+    download_done: Arc<AtomicU64>,
+    download_total: Arc<AtomicU64>,
+}
+
+struct Transfer {
+    kind: &'static str,
+    file_id: u32,
+    progress: f32,
 }
 
 impl MinlabelApp {
@@ -111,6 +122,9 @@ impl MinlabelApp {
             pending_download: None,
             pending_upload: None,
             cache_dir,
+            transfer: None,
+            download_done: Arc::new(AtomicU64::new(0)),
+            download_total: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -316,6 +330,11 @@ impl MinlabelApp {
             if !info.uploaded && !self.busy && self.pending_upload.is_none() {
                 self.busy = true;
                 self.pending_upload = Some(info.id);
+                self.transfer = Some(Transfer {
+                    kind: "upload",
+                    file_id: info.id,
+                    progress: 0.0,
+                });
                 let src = src.clone();
                 let room = self.room_info.room.clone();
                 let tx = self.io_tx.clone();
@@ -353,6 +372,15 @@ impl MinlabelApp {
         }
         self.busy = true;
         self.pending_download = Some(info.id);
+        self.transfer = Some(Transfer {
+            kind: "download",
+            file_id: info.id,
+            progress: 0.0,
+        });
+        self.download_done.store(0, Ordering::Relaxed);
+        self.download_total.store(0, Ordering::Relaxed);
+        let done = Arc::clone(&self.download_done);
+        let total = Arc::clone(&self.download_total);
         log_line(&format!(
             "ensure_current_audio: id={} uploaded, starting download",
             info.id
@@ -363,7 +391,7 @@ impl MinlabelApp {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| format!("{}", info.id));
         std::thread::spawn(move || {
-            match net::fetch_audio(&server, http_port, info.id, &dest) {
+            match net::fetch_audio(&server, http_port, info.id, &dest, &done, &total) {
                 Ok(()) => {
                     // Pull the matching .lab / .json sidecars if the server has them.
                     for ext in ["lab", "json"] {
@@ -433,6 +461,11 @@ impl MinlabelApp {
         let user = net.username.clone();
         let src = src.clone();
         self.pending_upload = Some(file_id);
+        self.transfer = Some(Transfer {
+            kind: "upload",
+            file_id,
+            progress: 0.0,
+        });
         let tx = self.io_tx.clone();
         log_line(&format!(
             "handle_file_requested: id={} uploading {}",
@@ -693,11 +726,27 @@ impl MinlabelApp {
             self.pending_download = None;
             self.pending_upload = None;
             self.current_audio = None;
+            self.transfer = None;
         }
         self.poll_io();
     }
 
     fn poll_io(&mut self) {
+        // Advance transfer progress: downloads use real byte counts,
+        // uploads get a fake ramp so the bar is visible.
+        if let Some(t) = &mut self.transfer {
+            if t.kind == "download" {
+                let done = self.download_done.load(Ordering::Relaxed);
+                let total = self.download_total.load(Ordering::Relaxed);
+                t.progress = if total > 0 {
+                    done as f32 / total as f32
+                } else {
+                    (t.progress + 0.01).min(0.98)
+                };
+            } else {
+                t.progress = (t.progress + 0.02).min(0.95);
+            }
+        }
         let events: Vec<IoEvent> = self.io_events.lock().unwrap().try_iter().collect();
         for evt in events {
             match evt {
@@ -751,6 +800,7 @@ impl MinlabelApp {
                 IoEvent::DownloadDone { file_id, path } => {
                     self.busy = false;
                     self.pending_download = None;
+                    self.transfer = None;
                     log_line(&format!(
                         "io event: download_done {file_id} -> {}",
                         path.display()
@@ -763,11 +813,14 @@ impl MinlabelApp {
                         if let Some(f) = self.room_files.get(self.current_index) {
                             self.status = format!("Downloaded {}", f.name);
                         }
+                        // The sidecar .lab/.json arrived with the audio: load it.
+                        self.load_current_label();
                     }
                 }
                 IoEvent::DownloadFailed { file_id, msg } => {
                     self.busy = false;
                     self.pending_download = None;
+                    self.transfer = None;
                     log_line(&format!("io event: download_failed {file_id}: {msg}"));
                     self.status = format!("Download failed for file {file_id}: {msg}");
                 }
@@ -777,6 +830,7 @@ impl MinlabelApp {
                     log_line(&format!(
                         "io event: upload_done {file_id} ok={ok} msg={msg}"
                     ));
+                    self.transfer = None;
                     if ok {
                         if let Some(f) = self.room_files.iter_mut().find(|f| f.id == file_id) {
                             f.uploaded = true;
@@ -1335,6 +1389,21 @@ impl MinlabelApp {
             let bar = egui::ProgressBar::new(progress).show_percentage();
             ui.add_sized([ui.available_width() - 50.0, 18.0], bar);
             ui.label(format!("{:.0}%", progress * 100.0));
+
+            // In-flight upload/download progress (upload is fake, download real).
+            if let Some(t) = &self.transfer {
+                let label = if t.kind == "upload" {
+                    "Uploading"
+                } else {
+                    "Downloading"
+                };
+                ui.horizontal(|ui| {
+                    ui.label(format!("{label}:"));
+                    let bar = egui::ProgressBar::new(t.progress.clamp(0.0, 1.0)).show_percentage();
+                    ui.add_sized([ui.available_width() - 50.0, 18.0], bar);
+                    ui.label(format!("{:.0}%", t.progress.clamp(0.0, 1.0) * 100.0));
+                });
+            }
         });
     }
 }
