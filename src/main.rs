@@ -297,7 +297,7 @@ impl MinlabelApp {
                     let _ = tx.send(IoEvent::UploadDone {
                         file_id: info.id,
                         ok: r.is_ok(),
-                        msg: r.unwrap_or_default(),
+                        msg: r.err().unwrap_or_default(),
                     });
                 });
             }
@@ -369,7 +369,7 @@ impl MinlabelApp {
             let _ = tx.send(IoEvent::UploadDone {
                 file_id,
                 ok: r.is_ok(),
-                msg: r.unwrap_or_default(),
+                msg: r.err().unwrap_or_default(),
             });
         });
         self.status = format!("Uploading {} for a room member...", info.name);
