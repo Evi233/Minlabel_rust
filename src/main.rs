@@ -80,6 +80,8 @@ impl MinlabelApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         setup_fonts(&cc.egui_ctx);
         let (io_tx, io_rx) = std::sync::mpsc::channel::<IoEvent>();
+        let cache_dir = std::env::temp_dir().join("minlabel-cache");
+        let _ = std::fs::create_dir_all(&cache_dir);
         Self {
             folder: None,
             files: Vec::new(),
@@ -108,7 +110,7 @@ impl MinlabelApp {
             busy: false,
             pending_download: None,
             pending_upload: None,
-            cache_dir: std::env::temp_dir().join("minlabel-cache"),
+            cache_dir,
         }
     }
 

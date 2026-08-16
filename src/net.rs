@@ -401,6 +401,9 @@ pub fn fetch_audio(
         return Err(format!("download failed: {}", resp.status()));
     }
     let bytes = resp.bytes().map_err(|e| e.to_string())?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
     std::fs::write(dest, bytes).map_err(|e| e.to_string())
 }
 
