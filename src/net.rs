@@ -131,32 +131,20 @@ pub enum NetEvent {
     Error(String),
 }
 
-/// Results of background upload/download work, consumed on the UI thread.
+/// Results of background download work, consumed on the UI thread.
 #[derive(Debug)]
 pub enum IoEvent {
-    RoomCreated {
-        code: String,
-        client: NetClient,
-        files: Vec<FileInfo>,
-    },
     RoomJoined {
         client: NetClient,
         files: Vec<FileInfo>,
     },
     RoomFailed(String),
-    /// Metadata of newly registered files (no audio bytes uploaded yet).
-    FilesRegistered(Vec<FileInfo>),
     DownloadDone {
         file_id: u32,
         path: PathBuf,
     },
     DownloadFailed {
         file_id: u32,
-        msg: String,
-    },
-    UploadDone {
-        file_id: u32,
-        ok: bool,
         msg: String,
     },
 }
@@ -297,50 +285,6 @@ fn http_client() -> reqwest::blocking::Client {
         .unwrap_or_default()
 }
 
-/// Create a room; returns the 6-character room code.
-pub fn create_room(server: &str, http_port: u16, user: &str) -> Result<String, String> {
-    let url = format!("http://{server}:{http_port}/api/rooms");
-    let resp = http_client()
-        .post(&url)
-        .json(&serde_json::json!({ "user": user }))
-        .send()
-        .map_err(|e| e.to_string())?;
-    let v: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
-    v["id"]
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| "no room id".to_string())
-}
-
-/// Register file metadata (name/size) without uploading the audio bytes.
-/// Returns the registered files with their server ids.
-pub fn register_files(
-    server: &str,
-    http_port: u16,
-    room: &str,
-    user: &str,
-    files: &[(String, u64)],
-) -> Result<Vec<FileInfo>, String> {
-    let url = format!("http://{server}:{http_port}/api/rooms/{room}/files");
-    let list: Vec<serde_json::Value> = files
-        .iter()
-        .map(|(name, size)| serde_json::json!({ "name": name, "size": size }))
-        .collect();
-    let resp = http_client()
-        .post(&url)
-        .json(&serde_json::json!({ "user": user, "files": list }))
-        .send()
-        .map_err(|e| e.to_string())?;
-    let v: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
-    v["files"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|f| serde_json::from_value(f).map_err(|e| e.to_string()))
-        .collect()
-}
-
 pub fn fetch_room_files(server: &str, http_port: u16, room: &str) -> Result<Vec<FileInfo>, String> {
     let url = format!("http://{server}:{http_port}/api/rooms/{room}/files");
     let resp = http_client().get(&url).send().map_err(|e| e.to_string())?;
@@ -352,50 +296,6 @@ pub fn fetch_room_files(server: &str, http_port: u16, room: &str) -> Result<Vec<
         serde_json::from_value(v.get("files").cloned().unwrap_or(serde_json::json!([])))
             .map_err(|e| e.to_string())?;
     Ok(files)
-}
-
-/// Upload a file's audio bytes to the server (called when another room
-/// member requested the file). The matching .lab / .json sidecar files are
-/// uploaded too when they exist next to the audio.
-pub fn upload_audio(
-    server: &str,
-    http_port: u16,
-    room: &str,
-    user: &str,
-    file_id: u32,
-    path: &std::path::Path,
-) -> Result<(), String> {
-    let url = format!("http://{server}:{http_port}/api/rooms/{room}/files/{file_id}/audio");
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "audio.bin".to_string());
-    let mut form = reqwest::blocking::multipart::Form::new()
-        .text("user", user.to_string())
-        .part(
-            "file",
-            reqwest::blocking::multipart::Part::file(path)
-                .map_err(|e| e.to_string())?
-                .file_name(name),
-        );
-    if let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().to_string()) {
-        for ext in ["lab", "json"] {
-            let sidecar = path.with_file_name(format!("{stem}.{ext}"));
-            if let Ok(text) = std::fs::read_to_string(&sidecar) {
-                form = form.text(ext, text);
-            }
-        }
-    }
-    let resp = http_client()
-        .post(&url)
-        .multipart(form)
-        .send()
-        .map_err(|e| e.to_string())?;
-    if resp.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!("upload failed: {}", resp.status()))
-    }
 }
 
 /// Download a file's audio. `done` / `total` are updated as bytes arrive so
