@@ -355,7 +355,8 @@ pub fn fetch_room_files(server: &str, http_port: u16, room: &str) -> Result<Vec<
 }
 
 /// Upload a file's audio bytes to the server (called when another room
-/// member requested the file).
+/// member requested the file). The matching .lab / .json sidecar files are
+/// uploaded too when they exist next to the audio.
 pub fn upload_audio(
     server: &str,
     http_port: u16,
@@ -369,7 +370,7 @@ pub fn upload_audio(
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "audio.bin".to_string());
-    let form = reqwest::blocking::multipart::Form::new()
+    let mut form = reqwest::blocking::multipart::Form::new()
         .text("user", user.to_string())
         .part(
             "file",
@@ -377,6 +378,14 @@ pub fn upload_audio(
                 .map_err(|e| e.to_string())?
                 .file_name(name),
         );
+    if let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().to_string()) {
+        for ext in ["lab", "json"] {
+            let sidecar = path.with_file_name(format!("{stem}.{ext}"));
+            if let Ok(text) = std::fs::read_to_string(&sidecar) {
+                form = form.text(ext, text);
+            }
+        }
+    }
     let resp = http_client()
         .post(&url)
         .multipart(form)
@@ -405,6 +414,31 @@ pub fn fetch_audio(
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     std::fs::write(dest, bytes).map_err(|e| e.to_string())
+}
+
+/// Download a .lab / .json sidecar next to the audio. Returns Ok(false) when
+/// the server has no such sidecar for this file.
+pub fn fetch_sidecar(
+    server: &str,
+    http_port: u16,
+    file_id: u32,
+    ext: &str,
+    dest: &std::path::Path,
+) -> Result<bool, String> {
+    let url = format!("http://{server}:{http_port}/api/files/{file_id}/{ext}");
+    let resp = http_client().get(&url).send().map_err(|e| e.to_string())?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    if !resp.status().is_success() {
+        return Err(format!("sidecar download failed: {}", resp.status()));
+    }
+    let bytes = resp.bytes().map_err(|e| e.to_string())?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(dest, bytes).map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 fn urlencode(s: &str) -> String {

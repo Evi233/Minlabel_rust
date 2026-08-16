@@ -358,9 +358,18 @@ impl MinlabelApp {
             info.id
         ));
         let tx = self.io_tx.clone();
-        std::thread::spawn(
-            move || match net::fetch_audio(&server, http_port, info.id, &dest) {
+        let stem = std::path::Path::new(&info.name)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("{}", info.id));
+        std::thread::spawn(move || {
+            match net::fetch_audio(&server, http_port, info.id, &dest) {
                 Ok(()) => {
+                    // Pull the matching .lab / .json sidecars if the server has them.
+                    for ext in ["lab", "json"] {
+                        let sidecar = dest.with_file_name(format!("{stem}.{ext}"));
+                        let _ = net::fetch_sidecar(&server, http_port, info.id, ext, &sidecar);
+                    }
                     let _ = tx.send(IoEvent::DownloadDone {
                         file_id: info.id,
                         path: dest,
@@ -372,8 +381,8 @@ impl MinlabelApp {
                         msg: e,
                     });
                 }
-            },
-        );
+            }
+        });
     }
 
     /// A room member asked for a file we own: upload it on demand.
